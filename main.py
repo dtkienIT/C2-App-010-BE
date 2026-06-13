@@ -8,6 +8,7 @@ from backend.core.config import settings
 from backend.core.errors import install_error_handlers
 from backend.dashboard.router import router as dashboard_router
 from backend.missions.router import router as missions_router
+from backend.newsfeed.router import router as newsfeed_router
 from backend.progress.router import router as progress_router
 from backend.quizzes.router import router as quizzes_router
 from backend.rewards.router import router as rewards_router
@@ -31,6 +32,7 @@ def create_app() -> FastAPI:
         users_router,
         dashboard_router,
         missions_router,
+        newsfeed_router,
         quizzes_router,
         progress_router,
         buddies_router,
