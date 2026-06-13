@@ -5,19 +5,25 @@ from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from html import unescape
 from html.parser import HTMLParser
+import ipaddress
 import re
+import socket
 from urllib.error import URLError
 from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
-import xml.etree.ElementTree as ET
 
+from defusedxml import ElementTree as DET
+
+from backend.core.config import settings
 from backend.newsfeed.schemas import NewsfeedItem, NewsfeedResponse
 
 USER_AGENT = 'StudyBuddyNewsfeed/1.0 (+https://example.local)'
-REQUEST_TIMEOUT_SECONDS = 8
-CACHE_TTL = timedelta(minutes=20)
+REQUEST_TIMEOUT_SECONDS = settings.newsfeed_request_timeout_seconds
+CACHE_TTL = timedelta(minutes=settings.newsfeed_cache_ttl_minutes)
+CACHE_MAX_ITEMS = settings.newsfeed_cache_max_items
+ALLOWED_FEED_HOSTS = tuple(settings.newsfeed_allowed_hosts_list)
+ALLOWED_FEED_SCHEMES = ('http', 'https')
 MEDIA_NAMESPACE = {'media': 'http://search.yahoo.com/mrss/'}
-
 
 @dataclass(frozen=True)
 class FeedSource:
@@ -26,7 +32,6 @@ class FeedSource:
     url: str
     cta_label: str
     learning_action: str
-
 
 FEED_SOURCES: tuple[FeedSource, ...] = (
     FeedSource(
@@ -71,9 +76,72 @@ class _HTMLTextExtractor(HTMLParser):
         return ' '.join(self.parts)
 
 
+def _is_private_host(hostname: str) -> bool:
+    lowered = hostname.strip().lower()
+    if lowered in {'localhost', '127.0.0.1', '::1', '0.0.0.0'}:
+        return True
+
+    try:
+        parsed_ip = ipaddress.ip_address(lowered)
+        return (
+            parsed_ip.is_private
+            or parsed_ip.is_loopback
+            or parsed_ip.is_link_local
+            or parsed_ip.is_multicast
+            or parsed_ip.is_reserved
+            or parsed_ip.is_unspecified
+        )
+    except ValueError:
+        pass
+
+    try:
+        resolved_ips = {
+            info[4][0]
+            for info in socket.getaddrinfo(lowered, None, proto=socket.IPPROTO_TCP)
+        }
+    except socket.gaierror:
+        return True
+
+    for value in resolved_ips:
+        try:
+            parsed_ip = ipaddress.ip_address(value)
+        except ValueError:
+            return True
+        if (
+            parsed_ip.is_private
+            or parsed_ip.is_loopback
+            or parsed_ip.is_link_local
+            or parsed_ip.is_multicast
+            or parsed_ip.is_reserved
+            or parsed_ip.is_unspecified
+        ):
+            return True
+    return False
+
+
+def _validate_feed_url(url: str) -> str:
+    parsed = urlparse(url)
+    if parsed.scheme.lower() not in ALLOWED_FEED_SCHEMES:
+        raise ValueError('Only http/https feed URLs are allowed.')
+
+    hostname = (parsed.hostname or '').strip().lower()
+    if not hostname:
+        raise ValueError('Feed URL must include a valid hostname.')
+    if not ALLOWED_FEED_HOSTS:
+        raise ValueError('No allowed newsfeed hosts configured.')
+    if hostname not in ALLOWED_FEED_HOSTS:
+        raise ValueError('Feed host is not in the allowlist.')
+    if _is_private_host(hostname):
+        raise ValueError('Feed host resolves to a private or unsafe address.')
+    return url
+
+
 def _fetch_text(url: str) -> str:
-    request = Request(url, headers={'User-Agent': USER_AGENT})
+    safe_url = _validate_feed_url(url)
+    request = Request(safe_url, headers={'User-Agent': USER_AGENT})
     with urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+        final_url = response.geturl()
+        _validate_feed_url(final_url)
         return response.read().decode('utf-8', errors='ignore')
 
 
@@ -116,7 +184,7 @@ def _format_published_at(raw_value: str | None) -> str:
         return 'Moi cap nhat'
 
 
-def _find_image_url(item: ET.Element, link: str | None) -> str | None:
+def _find_image_url(item: DET.Element, link: str | None) -> str | None:
     media_thumbnail = item.find('media:thumbnail', MEDIA_NAMESPACE)
     if media_thumbnail is not None and media_thumbnail.attrib.get('url'):
         return media_thumbnail.attrib['url']
@@ -144,7 +212,7 @@ def _build_item_id(source_name: str, link: str | None, title: str) -> str:
 
 
 def _parse_feed(source: FeedSource, xml_text: str) -> list[NewsfeedItem]:
-    root = ET.fromstring(xml_text)
+    root = DET.fromstring(xml_text)
     items = root.findall('.//item')
     parsed_items: list[NewsfeedItem] = []
 
@@ -186,16 +254,31 @@ def _merge_by_round_robin(groups: list[list[NewsfeedItem]]) -> list[NewsfeedItem
     return merged
 
 
+def _dedupe_items(items: list[NewsfeedItem], limit: int) -> list[NewsfeedItem]:
+    deduped: list[NewsfeedItem] = []
+    seen_ids: set[str] = set()
+
+    for item in items:
+        if item.id in seen_ids:
+            continue
+        seen_ids.add(item.id)
+        deduped.append(item)
+        if len(deduped) >= limit:
+            break
+    return deduped
+
+
 def _cache_valid() -> bool:
     expires_at = _CACHE.get('expires_at')
     return isinstance(expires_at, datetime) and expires_at > datetime.now(UTC)
 
 
 def get_newsfeed(limit: int = 8) -> dict[str, object]:
+    safe_limit = max(1, min(limit, CACHE_MAX_ITEMS))
     if _cache_valid() and _CACHE.get('items'):
         cached_items = _CACHE['items']
         if isinstance(cached_items, list):
-            return NewsfeedResponse(items=cached_items[:limit]).model_dump()
+            return NewsfeedResponse(items=cached_items[:safe_limit]).model_dump()
 
     grouped_items: list[list[NewsfeedItem]] = []
     for source in FEED_SOURCES:
@@ -204,10 +287,11 @@ def get_newsfeed(limit: int = 8) -> dict[str, object]:
             parsed_items = _parse_feed(source, xml_text)
             if parsed_items:
                 grouped_items.append(parsed_items)
-        except (URLError, TimeoutError, ET.ParseError, ValueError):
+        except (URLError, TimeoutError, DET.ParseError, ValueError):
             continue
 
-    items = _merge_by_round_robin(grouped_items)[:limit]
+    merged_items = _merge_by_round_robin(grouped_items)
+    items = _dedupe_items(merged_items, CACHE_MAX_ITEMS)
     _CACHE['items'] = items
     _CACHE['expires_at'] = datetime.now(UTC) + CACHE_TTL
-    return NewsfeedResponse(items=items).model_dump()
+    return NewsfeedResponse(items=items[:safe_limit]).model_dump()
