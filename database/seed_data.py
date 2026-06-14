@@ -25,6 +25,24 @@ DEFAULT_STATS = {
 
 BUDDIES = [
     {
+        "id": "chasam",
+        "name": "Chasam",
+        "role": "Mascot mochi hong",
+        "type": "Mascot mochi hong",
+        "emoji": "??",
+        "gradient": "from-pink-50 via-rose-50 to-orange-50",
+        "description": "Buddy mascot de thuong, duoc dung lam nhan vat 2D chinh trong Buddy Room.",
+        "personality": "Am ap, nhe nhang, hop voi khong gian phong hoc va cac skin reward.",
+        "avatar_url": "/buddies/chasam/icon.png",
+        "fallbackImage": "/buddies/chasam/icon.png",
+        "accent": "rose",
+        "default_mood": "happy",
+        "mood": "happy",
+        "rarity": "common",
+        "tags": ["Cute", "Reward", "Room", "Daily"],
+        "skills": ["Dong vien nhe nhang", "Phong hoc cozy", "Mo khoa skin reward"],
+    },
+    {
         "id": "lumi",
         "name": "Lumi",
         "role": "Robot AI Buddy",
