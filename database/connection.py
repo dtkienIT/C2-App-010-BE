@@ -103,7 +103,7 @@ class PostgresDatabase:
 def get_postgres_database() -> PostgresDatabase | None:
     if not settings.postgres_enabled:
         return None
-    return PostgresDatabase(settings.supabase_db_url)
+    return PostgresDatabase(settings.supabase_db_url, max_pool_size=settings.postgres_pool_max_size)
 
 
 class PooledPostgresConnection:

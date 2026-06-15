@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     newsfeed_cache_max_items: int = 24
     newsfeed_cache_ttl_minutes: int = 20
     newsfeed_request_timeout_seconds: int = 8
+    postgres_pool_max_size: int = 8
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
