@@ -49,6 +49,11 @@ class Settings(BaseSettings):
     smtp_use_tls: bool = True
     smtp_use_ssl: bool = False
     smtp_timeout_seconds: int = 10
+    otp_expires_minutes: int = 5
+    otp_resend_cooldown_seconds: int = 60
+    otp_max_attempts: int = 5
+    otp_max_sends_per_15_minutes: int = 5
+    otp_pepper: str = "change-me-otp-pepper"
 
     model_config = SettingsConfigDict(env_file=str(ROOT_ENV_FILE), env_file_encoding="utf-8", extra="ignore")
 

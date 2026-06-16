@@ -16,8 +16,8 @@ from backend.database.seed_data import (
     ACHIEVEMENTS,
     BUDDIES,
     COMPANION_MODELS,
-    DEFAULT_STATS,
     MISSIONS,
+    NEW_USER_STATS,
     QUIZZES,
     ROOM_BACKGROUNDS,
 )
@@ -61,6 +61,14 @@ def json_value(value: Any) -> Any:
     return value
 
 
+def parse_datetime(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    text = str(value).replace("Z", "+00:00")
+    parsed = datetime.fromisoformat(text)
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
 class AppStore:
     def __init__(self) -> None:
         self._users: dict[str, dict[str, Any]] = {}
@@ -73,6 +81,7 @@ class AppStore:
         self._attempt_answers: dict[str, list[dict[str, Any]]] = {}
         self._user_achievements: dict[str, list[dict[str, Any]]] = {}
         self._buddies_cache: list[dict[str, Any]] | None = None
+        self._email_verification_otps: list[dict[str, Any]] = []
 
     @property
     def use_postgres(self) -> bool:
@@ -98,8 +107,8 @@ class AppStore:
                         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email already registered")
                     cursor.execute(
                         """
-                        insert into profiles (id, email, display_name, avatar_url, role, password_hash, created_at, updated_at)
-                        values (%s::uuid, %s, %s, %s, %s, %s, now(), now())
+                        insert into profiles (id, email, display_name, avatar_url, role, password_hash, is_email_verified, email_verified_at, status, created_at, updated_at)
+                        values (%s::uuid, %s, %s, %s, %s, %s, false, null, 'pending_verification', now(), now())
                         returning *
                         """,
                         (str(uuid4()), email, display_name or email.split("@")[0], "", "student", hash_password(password)),
@@ -122,11 +131,14 @@ class AppStore:
                 "avatar_url": "",
                 "role": "student",
                 "password_hash": hash_password(password),
+                "is_email_verified": False,
+                "email_verified_at": None,
+                "status": "pending_verification",
                 "created_at": utc_now(),
                 "updated_at": utc_now(),
             }
             self._table("profiles").insert(row).execute()
-            self._table("user_stats").insert({"user_id": row["id"], **DEFAULT_STATS, "last_active_at": utc_now(), "updated_at": utc_now()}).execute()
+            self._table("user_stats").insert({"user_id": row["id"], **NEW_USER_STATS, "last_active_at": utc_now(), "updated_at": utc_now()}).execute()
             self.ensure_user_defaults(row["id"])
             return row
 
@@ -139,12 +151,15 @@ class AppStore:
             "avatar_url": "",
             "role": "student",
             "password_hash": hash_password(password),
+            "is_email_verified": False,
+            "email_verified_at": None,
+            "status": "pending_verification",
             "created_at": utc_now(),
             "updated_at": utc_now(),
         }
         self._users[row["id"]] = row
         self._users_by_email[email] = row["id"]
-        self._stats[row["id"]] = {"user_id": row["id"], **deepcopy(DEFAULT_STATS), "last_active_at": utc_now(), "updated_at": utc_now()}
+        self._stats[row["id"]] = {"user_id": row["id"], **deepcopy(NEW_USER_STATS), "last_active_at": utc_now(), "updated_at": utc_now()}
         self.ensure_user_defaults(row["id"])
         return row
 
@@ -168,6 +183,33 @@ class AppStore:
         self.ensure_user_defaults(user["id"])
         return user
 
+    def mark_email_verified(self, user_id: str) -> dict[str, Any]:
+        if self.use_postgres:
+            row = postgres_db.execute_returning(
+                """
+                update profiles
+                set is_email_verified = true,
+                    email_verified_at = now(),
+                    status = 'active',
+                    updated_at = now()
+                where id = %s::uuid
+                returning *
+                """,
+                (user_id,),
+            )
+            if not row:
+                raise HTTPException(status_code=404, detail="User not found")
+            row = dict(row)
+            row["id"] = str(row["id"])
+            return row
+        if self.use_supabase:
+            fields = {"is_email_verified": True, "email_verified_at": utc_now(), "status": "active", "updated_at": utc_now()}
+            self._table("profiles").update(fields).eq("id", user_id).execute()
+            return self.get_user(user_id)
+        user = self._users[user_id]
+        user.update({"is_email_verified": True, "email_verified_at": utc_now(), "status": "active", "updated_at": utc_now()})
+        return user
+
     def get_user_by_email(self, email: str) -> dict[str, Any] | None:
         email = email.strip().lower()
         if self.use_postgres:
@@ -182,6 +224,119 @@ class AppStore:
             return rows[0] if rows else None
         user_id = self._users_by_email.get(email)
         return self._users.get(user_id) if user_id else None
+
+    def get_user_by_verification_session(self, verification_session_id: str) -> dict[str, Any] | None:
+        otp = self.get_email_verification_otp(verification_session_id)
+        if not otp:
+            return None
+        return self.get_user(str(otp["user_id"]))
+
+    def invalidate_pending_email_otps(self, user_id: str) -> None:
+        if self.use_postgres:
+            postgres_db.execute(
+                """
+                update email_verification_otps
+                set used_at = coalesce(used_at, now()), updated_at = now()
+                where user_id = %s::uuid and used_at is null
+                """,
+                (user_id,),
+            )
+            return
+        if self.use_supabase:
+            self._table("email_verification_otps").update({"used_at": utc_now(), "updated_at": utc_now()}).eq("user_id", user_id).is_("used_at", "null").execute()
+            return
+        now = utc_now()
+        for otp in self._email_verification_otps:
+            if str(otp["user_id"]) == str(user_id) and not otp.get("used_at"):
+                otp["used_at"] = now
+                otp["updated_at"] = now
+
+    def create_email_verification_otp(self, user_id: str, verification_session_id: str, otp_hash: str, expires_at: datetime) -> dict[str, Any]:
+        if self.use_postgres:
+            row = postgres_db.execute_returning(
+                """
+                insert into email_verification_otps (id, user_id, verification_session_id, otp_hash, expires_at, attempt_count, last_sent_at, created_at, updated_at)
+                values (%s::uuid, %s::uuid, %s::uuid, %s, %s, 0, now(), now(), now())
+                returning *
+                """,
+                (str(uuid4()), user_id, verification_session_id, otp_hash, expires_at),
+            )
+            return dict(row)
+        row = {
+            "id": str(uuid4()),
+            "user_id": user_id,
+            "verification_session_id": verification_session_id,
+            "otp_hash": otp_hash,
+            "expires_at": expires_at,
+            "attempt_count": 0,
+            "used_at": None,
+            "locked_at": None,
+            "last_sent_at": utc_now(),
+            "created_at": utc_now(),
+            "updated_at": utc_now(),
+        }
+        if self.use_supabase:
+            self._table("email_verification_otps").insert(row).execute()
+        else:
+            self._email_verification_otps.append(row)
+        return row
+
+    def get_email_verification_otp(self, verification_session_id: str) -> dict[str, Any] | None:
+        if self.use_postgres:
+            row = postgres_db.fetch_one("select * from email_verification_otps where verification_session_id = %s::uuid", (verification_session_id,))
+            return dict(row) if row else None
+        if self.use_supabase:
+            rows = self._table("email_verification_otps").select("*").eq("verification_session_id", verification_session_id).execute().data
+            return rows[0] if rows else None
+        return next((otp for otp in self._email_verification_otps if str(otp["verification_session_id"]) == str(verification_session_id)), None)
+
+    def get_latest_email_otp_for_user(self, user_id: str) -> dict[str, Any] | None:
+        if self.use_postgres:
+            row = postgres_db.fetch_one(
+                "select * from email_verification_otps where user_id = %s::uuid order by created_at desc limit 1",
+                (user_id,),
+            )
+            return dict(row) if row else None
+        if self.use_supabase:
+            rows = self._table("email_verification_otps").select("*").eq("user_id", user_id).order("created_at", desc=True).limit(1).execute().data
+            return rows[0] if rows else None
+        rows = [otp for otp in self._email_verification_otps if str(otp["user_id"]) == str(user_id)]
+        return max(rows, key=lambda item: parse_datetime(item["created_at"])) if rows else None
+
+    def update_email_verification_otp(self, verification_session_id: str, patch: dict[str, Any]) -> dict[str, Any] | None:
+        patch = {**patch, "updated_at": utc_now()}
+        if self.use_postgres:
+            allowed = ["attempt_count", "used_at", "locked_at", "otp_hash", "expires_at", "last_sent_at"]
+            assignments = [f"{key} = %s" for key in allowed if key in patch]
+            params = [patch[key] for key in allowed if key in patch]
+            if not assignments:
+                return self.get_email_verification_otp(verification_session_id)
+            row = postgres_db.execute_returning(
+                f"""
+                update email_verification_otps
+                set {', '.join(assignments)}, updated_at = now()
+                where verification_session_id = %s::uuid
+                returning *
+                """,
+                (*params, verification_session_id),
+            )
+            return dict(row) if row else None
+        if self.use_supabase:
+            self._table("email_verification_otps").update(patch).eq("verification_session_id", verification_session_id).execute()
+            return self.get_email_verification_otp(verification_session_id)
+        otp = self.get_email_verification_otp(verification_session_id)
+        if otp:
+            otp.update(patch)
+        return otp
+
+    def count_recent_email_otps_for_user(self, user_id: str, since: datetime) -> int:
+        if self.use_postgres:
+            row = postgres_db.fetch_one("select count(*) as count from email_verification_otps where user_id = %s::uuid and created_at >= %s", (user_id, since))
+            return int(row["count"]) if row else 0
+        if self.use_supabase:
+            rows = self._table("email_verification_otps").select("id").eq("user_id", user_id).gte("created_at", since.isoformat()).execute().data
+            return len(rows)
+        return sum(1 for otp in self._email_verification_otps if str(otp["user_id"]) == str(user_id) and parse_datetime(otp["created_at"]) >= since)
 
     def get_user(self, user_id: str) -> dict[str, Any]:
         if self.use_postgres:
@@ -283,13 +438,13 @@ class AppStore:
             """,
             (
                 user_id,
-                DEFAULT_STATS["level"],
-                DEFAULT_STATS["xp"],
-                DEFAULT_STATS["coins"],
-                DEFAULT_STATS["streak"],
-                DEFAULT_STATS["total_quizzes"],
-                DEFAULT_STATS["total_correct_answers"],
-                DEFAULT_STATS["total_study_minutes"],
+                NEW_USER_STATS["level"],
+                NEW_USER_STATS["xp"],
+                NEW_USER_STATS["coins"],
+                NEW_USER_STATS["streak"],
+                NEW_USER_STATS["total_quizzes"],
+                NEW_USER_STATS["total_correct_answers"],
+                NEW_USER_STATS["total_study_minutes"],
             ),
         )
         cursor.execute(
@@ -344,7 +499,7 @@ class AppStore:
         if self.use_supabase:
             stats = self._table("user_stats").select("user_id").eq("user_id", user_id).execute().data
             if not stats:
-                self._table("user_stats").insert({"user_id": user_id, **DEFAULT_STATS, "last_active_at": utc_now(), "updated_at": utc_now()}).execute()
+                self._table("user_stats").insert({"user_id": user_id, **NEW_USER_STATS, "last_active_at": utc_now(), "updated_at": utc_now()}).execute()
             settings = self._table("user_companion_settings").select("user_id").eq("user_id", user_id).execute().data
             if not settings:
                 self._table("user_companion_settings").insert({
@@ -357,7 +512,7 @@ class AppStore:
                 }).execute()
             return
 
-        self._stats.setdefault(user_id, {"user_id": user_id, **deepcopy(DEFAULT_STATS), "last_active_at": utc_now(), "updated_at": utc_now()})
+        self._stats.setdefault(user_id, {"user_id": user_id, **deepcopy(NEW_USER_STATS), "last_active_at": utc_now(), "updated_at": utc_now()})
         self._settings.setdefault(
             user_id,
             {

@@ -14,6 +14,22 @@ class AuthRequest(BaseModel):
         return value
 
 
+class VerifyEmailRequest(BaseModel):
+    verification_session_id: str
+    otp: str = Field(min_length=6, max_length=6)
+
+    @field_validator("otp")
+    @classmethod
+    def validate_otp(cls, value: str) -> str:
+        if not value.isdigit():
+            raise ValueError("OTP must contain exactly 6 digits")
+        return value
+
+
+class ResendVerificationOtpRequest(BaseModel):
+    verification_session_id: str
+
+
 class AuthUser(BaseModel):
     id: str
     email: str

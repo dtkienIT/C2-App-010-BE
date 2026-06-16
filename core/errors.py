@@ -14,9 +14,10 @@ def fail(message: str, details: object | None = None) -> dict[str, object]:
 def install_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(HTTPException)
     async def http_exception_handler(_request: Request, exc: HTTPException) -> JSONResponse:
-        detail = exc.detail if isinstance(exc.detail, str) else "Request failed"
-        details = {} if isinstance(exc.detail, str) else exc.detail
-        return JSONResponse(status_code=exc.status_code, content=fail(detail, details))
+        if isinstance(exc.detail, dict):
+            message = str(exc.detail.get("message") or "Request failed")
+            return JSONResponse(status_code=exc.status_code, content=fail(message, exc.detail))
+        return JSONResponse(status_code=exc.status_code, content=fail(str(exc.detail), {}))
 
     @app.exception_handler(RequestValidationError)
     async def validation_exception_handler(_request: Request, exc: RequestValidationError) -> JSONResponse:
@@ -25,4 +26,3 @@ def install_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(Exception)
     async def unhandled_exception_handler(_request: Request, exc: Exception) -> JSONResponse:
         return JSONResponse(status_code=500, content=fail("Internal server error", {"type": type(exc).__name__}))
-

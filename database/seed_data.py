@@ -23,6 +23,16 @@ DEFAULT_STATS = {
     "total_study_minutes": 1120,
 }
 
+NEW_USER_STATS = {
+    "level": 1,
+    "xp": 0,
+    "coins": 0,
+    "streak": 0,
+    "total_quizzes": 0,
+    "total_correct_answers": 0,
+    "total_study_minutes": 0,
+}
+
 BUDDIES = [
     {
         "id": "chasam",

@@ -24,6 +24,7 @@ EXPECTED_TABLES = [
     "notification_outbox",
     "notification_deliveries",
     "notification_email_deliveries",
+    "email_verification_otps",
 ]
 
 
