@@ -16,7 +16,7 @@ DEFAULT_USER = {
 DEFAULT_STATS = {
     "level": 12,
     "xp": 680,
-    "coins": 2450,
+    "coins": 0,
     "streak": 12,
     "total_quizzes": 32,
     "total_correct_answers": 81,
@@ -229,21 +229,21 @@ ACHIEVEMENTS = [
 COMPANION_ACTIONS = ["idle", "relax", "thinking", "lookAround", "clapping", "goodbye", "jump", "angry", "blush", "sad", "sleepy", "surprised", "greeting", "peace", "shoot", "spin", "pose", "catwalk", "squat", "rasengan"]
 
 COMPANION_MODELS = [
-    {"id": "changli-vrm", "name": "Changli", "description": "Model VRM Changli.", "model_url": "/vrm-models/Changli.vrm", "thumbnail_url": "", "rarity": "common", "price": 0, "tags": ["shop"], "actions": COMPANION_ACTIONS, "accent": "rose", "source": "shop"},
-    {"id": "yinlin-vrm", "name": "Yinlin", "description": "Model VRM Yinlin.", "model_url": "/vrm-models/Yinlin.vrm", "thumbnail_url": "", "rarity": "common", "price": 0, "tags": ["shop"], "actions": COMPANION_ACTIONS, "accent": "violet", "source": "shop"},
-    {"id": "carlotta-vrm", "name": "Carlotta", "description": "Model VRM Carlotta.", "model_url": "/vrm-models/Carlotta.vrm", "thumbnail_url": "", "rarity": "common", "price": 0, "tags": ["shop"], "actions": COMPANION_ACTIONS, "accent": "cyan", "source": "shop"},
-    {"id": "naruto-vrm", "name": "Naruto", "description": "Model VRM Naruto.", "model_url": "/vrm-models/naruto.vrm", "thumbnail_url": "", "rarity": "common", "price": 0, "tags": ["shop"], "actions": COMPANION_ACTIONS, "accent": "amber", "source": "shop"},
-    {"id": "vita-vrm", "name": "Vivi", "description": "Model VRM mascot.", "model_url": "/vrm-models/vita.vrm", "thumbnail_url": "", "rarity": "common", "price": 0, "tags": ["shop"], "actions": COMPANION_ACTIONS, "accent": "cyan", "source": "shop"},
+    {"id": "changli-vrm", "name": "Changli", "description": "Model VRM Changli.", "model_url": "/vrm-models/Changli.vrm", "thumbnail_url": "", "rarity": "common", "price": 1, "tags": ["shop"], "actions": COMPANION_ACTIONS, "accent": "rose", "source": "shop"},
+    {"id": "yinlin-vrm", "name": "Yinlin", "description": "Model VRM Yinlin.", "model_url": "/vrm-models/Yinlin.vrm", "thumbnail_url": "", "rarity": "common", "price": 1, "tags": ["shop"], "actions": COMPANION_ACTIONS, "accent": "violet", "source": "shop"},
+    {"id": "carlotta-vrm", "name": "Carlotta", "description": "Model VRM Carlotta.", "model_url": "/vrm-models/Carlotta.vrm", "thumbnail_url": "", "rarity": "common", "price": 1, "tags": ["shop"], "actions": COMPANION_ACTIONS, "accent": "cyan", "source": "shop"},
+    {"id": "naruto-vrm", "name": "Naruto", "description": "Model VRM Naruto.", "model_url": "/vrm-models/naruto.vrm", "thumbnail_url": "", "rarity": "common", "price": 1, "tags": ["shop"], "actions": COMPANION_ACTIONS, "accent": "amber", "source": "shop"},
+    {"id": "vita-vrm", "name": "Vivi", "description": "Model VRM mascot.", "model_url": "/vrm-models/vita.vrm", "thumbnail_url": "", "rarity": "common", "price": 1, "tags": ["shop"], "actions": COMPANION_ACTIONS, "accent": "cyan", "source": "shop"},
     {"id": "buddy-1-vrm", "name": "Luna", "description": "Achievement VRM model.", "model_url": "/vrm-models/6493143135142452442.vrm", "thumbnail_url": "", "rarity": "achievement", "price": 0, "tags": ["achievement"], "actions": COMPANION_ACTIONS, "accent": "violet", "source": "achievement"},
 ]
 
 ROOM_BACKGROUNDS = [
-    {"id": "cozy-night", "name": "Đêm ấm áp", "description": "Góc học đêm với ánh sao dịu.", "image_url": "/backgrounds/cozy-night.png", "thumbnail_url": "/backgrounds/cozy-night.png", "price": 0, "accent": "indigo"},
-    {"id": "study-room-sunlit", "name": "Phòng học nắng sớm", "description": "Không gian học tập ấm áp.", "image_url": "/backgrounds/study-room-sunlit.png", "thumbnail_url": "/backgrounds/study-room-sunlit.png", "price": 0, "accent": "amber"},
-    {"id": "pastel-study", "name": "Pastel dịu nhẹ", "description": "Không gian pastel sáng.", "image_url": "/backgrounds/pastel-study.png", "thumbnail_url": "/backgrounds/pastel-study.png", "price": 0, "accent": "violet"},
-    {"id": "forest-path-bright", "name": "Lối rừng tươi sáng", "description": "Con đường xanh mát giữa rừng.", "image_url": "/backgrounds/forest-path-bright.png", "thumbnail_url": "/backgrounds/forest-path-bright.png", "price": 0, "accent": "emerald"},
-    {"id": "neon-tech", "name": "Phòng AI neon", "description": "Phong cách công nghệ xanh tím.", "image_url": "/backgrounds/neon-tech.png", "thumbnail_url": "/backgrounds/neon-tech.png", "price": 0, "accent": "cyan"},
-    {"id": "lake-meadow-bright", "name": "Hồ cỏ ban mai", "description": "Mặt hồ và đồng cỏ rộng mở.", "image_url": "/backgrounds/lake-meadow-bright.png", "thumbnail_url": "/backgrounds/lake-meadow-bright.png", "price": 0, "accent": "cyan"},
-    {"id": "cozy-lounge", "name": "Góc đọc sách", "description": "Không gian thư giãn với ghế lười.", "image_url": "/backgrounds/cozy-lounge.png", "thumbnail_url": "/backgrounds/cozy-lounge.png", "price": 0, "accent": "amber"},
+    {"id": "cozy-night", "name": "Đêm ấm áp", "description": "Góc học đêm với ánh sao dịu.", "image_url": "/backgrounds/cozy-night.png", "thumbnail_url": "/backgrounds/cozy-night.png", "price": 1, "accent": "indigo"},
+    {"id": "study-room-sunlit", "name": "Phòng học nắng sớm", "description": "Không gian học tập ấm áp.", "image_url": "/backgrounds/study-room-sunlit.png", "thumbnail_url": "/backgrounds/study-room-sunlit.png", "price": 1, "accent": "amber"},
+    {"id": "pastel-study", "name": "Pastel dịu nhẹ", "description": "Không gian pastel sáng.", "image_url": "/backgrounds/pastel-study.png", "thumbnail_url": "/backgrounds/pastel-study.png", "price": 1, "accent": "violet"},
+    {"id": "forest-path-bright", "name": "Lối rừng tươi sáng", "description": "Con đường xanh mát giữa rừng.", "image_url": "/backgrounds/forest-path-bright.png", "thumbnail_url": "/backgrounds/forest-path-bright.png", "price": 1, "accent": "emerald"},
+    {"id": "neon-tech", "name": "Phòng AI neon", "description": "Phong cách công nghệ xanh tím.", "image_url": "/backgrounds/neon-tech.png", "thumbnail_url": "/backgrounds/neon-tech.png", "price": 1, "accent": "cyan"},
+    {"id": "lake-meadow-bright", "name": "Hồ cỏ ban mai", "description": "Mặt hồ và đồng cỏ rộng mở.", "image_url": "/backgrounds/lake-meadow-bright.png", "thumbnail_url": "/backgrounds/lake-meadow-bright.png", "price": 1, "accent": "cyan"},
+    {"id": "cozy-lounge", "name": "Góc đọc sách", "description": "Không gian thư giãn với ghế lười.", "image_url": "/backgrounds/cozy-lounge.png", "thumbnail_url": "/backgrounds/cozy-lounge.png", "price": 1, "accent": "amber"},
 ]
 

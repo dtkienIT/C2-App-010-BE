@@ -1,7 +1,7 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from copy import deepcopy
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 import json
 import random
 import re
@@ -52,7 +52,80 @@ def initials(name: str) -> str:
 
 
 def next_level_xp(level: int) -> int:
-    return max(1000, level * 100)
+    safe_level = max(1, level)
+    return 120 + (safe_level - 1) * 55
+
+
+def clamp(value: int, minimum: int = 0, maximum: int = 100) -> int:
+    return max(minimum, min(maximum, value))
+
+
+def parse_iso_datetime(value: Any) -> datetime | None:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value.astimezone(timezone.utc) if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+        except ValueError:
+            return None
+    return None
+
+
+def resolve_level_progress(total_xp: int) -> dict[str, int]:
+    safe_total_xp = max(0, int(total_xp))
+    level = 1
+    xp_into_level = safe_total_xp
+    while xp_into_level >= next_level_xp(level):
+        xp_into_level -= next_level_xp(level)
+        level += 1
+    return {
+        "level": level,
+        "next_level_xp": next_level_xp(level),
+        "total_xp": safe_total_xp,
+        "xp_into_level": xp_into_level,
+    }
+
+
+def resolve_buddy_mood(joy: int, energy: int, focus: int) -> str:
+    if joy >= 90 and focus >= 82:
+        return "levelUp"
+    if joy >= 72:
+        return "happy"
+    if energy <= 34:
+        return "calm"
+    if focus >= 74:
+        return "focus"
+    return "idle"
+
+
+def default_buddy_state(buddy: dict[str, Any] | None = None) -> dict[str, Any]:
+    base_mood = (buddy or {}).get("mood") or (buddy or {}).get("default_mood") or "focus"
+    return {
+        "joy": 84,
+        "energy": 76,
+        "focus": 68,
+        "mood": base_mood,
+    }
+
+
+def calculate_streak(previous_streak: int, previous_last_active_at: Any, next_last_active_at: Any) -> int:
+    next_active_at = parse_iso_datetime(next_last_active_at)
+    if not next_active_at:
+        return max(0, previous_streak)
+
+    previous_active_at = parse_iso_datetime(previous_last_active_at)
+    if not previous_active_at:
+        return max(1, previous_streak or 0)
+
+    next_day = next_active_at.date()
+    previous_day = previous_active_at.date()
+    if next_day == previous_day:
+        return max(1, previous_streak or 0)
+    if next_day == previous_day + timedelta(days=1):
+        return max(1, previous_streak or 0) + 1
+    return 1
 
 
 def json_value(value: Any) -> Any:
@@ -75,6 +148,9 @@ class AppStore:
         self._users_by_email: dict[str, str] = {}
         self._stats: dict[str, dict[str, Any]] = {}
         self._user_buddies: dict[str, list[dict[str, Any]]] = {}
+        self._buddy_states: dict[str, dict[str, dict[str, Any]]] = {}
+        self._unlocked_models: dict[str, set[str]] = {}
+        self._unlocked_backgrounds: dict[str, set[str]] = {}
         self._settings: dict[str, dict[str, Any]] = {}
         self._user_missions: dict[str, list[dict[str, Any]]] = {}
         self._attempts: dict[str, dict[str, Any]] = {}
@@ -395,15 +471,17 @@ class AppStore:
                 row = postgres_db.fetch_one("select * from user_stats where user_id = %s::uuid", (user_id,))
             if not row:
                 raise HTTPException(status_code=404, detail="User stats not found")
-            return dict(row)
+            return self.normalize_stats_row(dict(row))
         if self.use_supabase:
             rows = self._table("user_stats").select("*").eq("user_id", user_id).execute().data
-            return rows[0]
-        return self._stats[user_id]
+            return self.normalize_stats_row(rows[0])
+        return self.normalize_stats_row(self._stats[user_id])
 
     def update_stats(self, user_id: str, patch: dict[str, Any]) -> dict[str, Any]:
         current = self.get_stats(user_id)
-        next_row = {**current, **patch, "updated_at": utc_now()}
+        next_row = self.normalize_stats_row({**current, **patch, "updated_at": utc_now()})
+        if "last_active_at" in patch and patch.get("last_active_at"):
+            next_row["streak"] = calculate_streak(current.get("streak", 0), current.get("last_active_at"), patch.get("last_active_at"))
         if self.use_postgres:
             allowed = {
                 "level",
@@ -415,8 +493,8 @@ class AppStore:
                 "total_study_minutes",
                 "last_active_at",
             }
-            assignments = [f"{key} = %s" for key in patch if key in allowed]
-            params = [patch[key] for key in patch if key in allowed]
+            assignments = [f"{key} = %s" for key in next_row if key in allowed]
+            params = [next_row[key] for key in next_row if key in allowed]
             if assignments:
                 postgres_db.execute(
                     f"update user_stats set {', '.join(assignments)}, updated_at = now() where user_id = %s::uuid",
@@ -427,6 +505,15 @@ class AppStore:
             self._table("user_stats").update(next_row).eq("user_id", user_id).execute()
         else:
             self._stats[user_id] = next_row
+        return next_row
+
+    def normalize_stats_row(self, row: dict[str, Any]) -> dict[str, Any]:
+        next_row = dict(row)
+        next_row["xp"] = max(0, int(next_row.get("xp", 0) or 0))
+        next_row["coins"] = max(0, int(next_row.get("coins", 0) or 0))
+        next_row["streak"] = max(0, int(next_row.get("streak", 0) or 0))
+        progress = resolve_level_progress(next_row["xp"])
+        next_row["level"] = progress["level"]
         return next_row
 
     def _ensure_user_defaults_postgres(self, user_id: str, cursor: Any) -> None:
@@ -462,6 +549,20 @@ class AppStore:
             cursor.execute(
                 f"""
                 insert into user_buddies (user_id, buddy_id, is_selected, level, xp, created_at, updated_at)
+                values {values_sql}
+                on conflict (user_id, buddy_id) do nothing
+                """,
+                params,
+            )
+            buddy_state_rows = []
+            for buddy in BUDDIES:
+                state = default_buddy_state(buddy)
+                buddy_state_rows.append((user_id, buddy["id"], state["joy"], state["energy"], state["focus"], state["mood"]))
+            values_sql = ", ".join(["(%s::uuid, %s, %s, %s, %s, %s, now())"] * len(buddy_state_rows))
+            params = tuple(value for row in buddy_state_rows for value in row)
+            cursor.execute(
+                f"""
+                insert into user_buddy_states (user_id, buddy_id, joy, energy, focus, mood, updated_at)
                 values {values_sql}
                 on conflict (user_id, buddy_id) do nothing
                 """,
@@ -529,6 +630,15 @@ class AppStore:
                 {"id": str(uuid4()), "user_id": user_id, "buddy_id": buddy["id"], "is_selected": buddy["id"] == "miu", "level": 8, "xp": 720, "created_at": utc_now(), "updated_at": utc_now()}
                 for buddy in BUDDIES
             ]
+        self._buddy_states.setdefault(
+            user_id,
+            {
+                buddy["id"]: {**default_buddy_state(buddy), "user_id": user_id, "buddy_id": buddy["id"], "updated_at": utc_now()}
+                for buddy in BUDDIES
+            },
+        )
+        self._unlocked_models.setdefault(user_id, set())
+        self._unlocked_backgrounds.setdefault(user_id, set())
         self._user_missions.setdefault(user_id, [])
         self._user_achievements.setdefault(user_id, [])
         self.ensure_mission_rows(user_id)
@@ -619,6 +729,209 @@ class AppStore:
         buddy = next((item for item in buddies if item["id"] == settings.get("active_buddy_id")), buddies[0])
         return self.enrich_buddy(user_id, buddy)
 
+    def get_buddy_state(self, user_id: str, buddy_id: str) -> dict[str, Any]:
+        buddy = next((item for item in self.list_buddies() if item["id"] == buddy_id), None)
+        fallback = {
+            **default_buddy_state(buddy),
+            "user_id": user_id,
+            "buddy_id": buddy_id,
+            "updated_at": utc_now(),
+        }
+        if self.use_postgres:
+            row = postgres_db.fetch_one(
+                "select * from user_buddy_states where user_id = %s::uuid and buddy_id = %s",
+                (user_id, buddy_id),
+            )
+            return {**fallback, **(dict(row) if row else {})}
+        if self.use_supabase:
+            rows = self._table("user_buddy_states").select("*").eq("user_id", user_id).eq("buddy_id", buddy_id).execute().data
+            return {**fallback, **(rows[0] if rows else {})}
+        self.ensure_user_defaults(user_id)
+        return {**fallback, **self._buddy_states[user_id].get(buddy_id, {})}
+
+    def update_buddy_state(self, user_id: str, buddy_id: str, patch: dict[str, Any]) -> dict[str, Any]:
+        current = self.get_buddy_state(user_id, buddy_id)
+        next_row = {
+            **current,
+            **patch,
+            "joy": clamp(int(patch.get("joy", current.get("joy", 84)))),
+            "energy": clamp(int(patch.get("energy", current.get("energy", 76)))),
+            "focus": clamp(int(patch.get("focus", current.get("focus", 68)))),
+            "updated_at": utc_now(),
+        }
+        next_row["mood"] = patch.get("mood") or resolve_buddy_mood(next_row["joy"], next_row["energy"], next_row["focus"])
+        if self.use_postgres:
+            postgres_db.execute(
+                """
+                insert into user_buddy_states (user_id, buddy_id, joy, energy, focus, mood, updated_at)
+                values (%s::uuid, %s, %s, %s, %s, %s, now())
+                on conflict (user_id, buddy_id)
+                do update set
+                    joy = excluded.joy,
+                    energy = excluded.energy,
+                    focus = excluded.focus,
+                    mood = excluded.mood,
+                    updated_at = now()
+                """,
+                (user_id, buddy_id, next_row["joy"], next_row["energy"], next_row["focus"], next_row["mood"]),
+            )
+            return self.get_buddy_state(user_id, buddy_id)
+        if self.use_supabase:
+            self._table("user_buddy_states").upsert(next_row).execute()
+            return next_row
+        self.ensure_user_defaults(user_id)
+        self._buddy_states[user_id][buddy_id] = next_row
+        return next_row
+
+    def update_buddy_progress(self, user_id: str, buddy_id: str, xp_delta: int) -> dict[str, Any]:
+        safe_delta = max(0, int(xp_delta))
+        if self.use_postgres:
+            postgres_db.execute(
+                "update user_buddies set xp = xp + %s, updated_at = now() where user_id = %s::uuid and buddy_id = %s",
+                (safe_delta, user_id, buddy_id),
+            )
+            row = postgres_db.fetch_one(
+                "select * from user_buddies where user_id = %s::uuid and buddy_id = %s",
+                (user_id, buddy_id),
+            )
+            if not row:
+                raise HTTPException(status_code=404, detail="Buddy progress not found")
+            progress = resolve_level_progress(dict(row).get("xp", 0))
+            postgres_db.execute(
+                "update user_buddies set level = %s, updated_at = now() where user_id = %s::uuid and buddy_id = %s",
+                (progress["level"], user_id, buddy_id),
+            )
+            row = postgres_db.fetch_one(
+                "select * from user_buddies where user_id = %s::uuid and buddy_id = %s",
+                (user_id, buddy_id),
+            )
+            return dict(row)
+        self.ensure_user_defaults(user_id)
+        row = next((item for item in self._user_buddies[user_id] if item["buddy_id"] == buddy_id), None)
+        if not row:
+            raise HTTPException(status_code=404, detail="Buddy progress not found")
+        row["xp"] = max(0, int(row.get("xp", 0) or 0) + safe_delta)
+        row["level"] = resolve_level_progress(row["xp"])["level"]
+        row["updated_at"] = utc_now()
+        return row
+
+    def gamification_rules(self) -> dict[str, Any]:
+        return {
+            "levels": {
+                "baseXp": 120,
+                "perLevelStep": 55,
+                "formula": "next_level_xp = 120 + (level - 1) * 55",
+            },
+            "streaks": {
+                "sameDay": "Giữ nguyên streak",
+                "nextDay": "Tăng streak thêm 1",
+                "missedDay": "Reset về 1",
+            },
+            "miniQuizRewards": {
+                "beginner": {"joy": 3, "energy": 2, "focus": 1},
+                "intermediate": {"joy": 5, "energy": 3, "focus": 3},
+                "advanced": {"joy": 8, "energy": 4, "focus": 6},
+            },
+        }
+
+    def calculate_buddy_reward(
+        self,
+        *,
+        activity_type: str,
+        difficulty: str = "beginner",
+        total_questions: int = 1,
+        correct_answers: int = 0,
+        duration_seconds: int | None = None,
+    ) -> dict[str, Any]:
+        difficulty_key = difficulty if difficulty in {"beginner", "intermediate", "advanced"} else "beginner"
+        bases = {
+            "beginner": {"joy": 3, "energy": 2, "focus": 1, "buddy_xp": 14},
+            "intermediate": {"joy": 5, "energy": 3, "focus": 3, "buddy_xp": 24},
+            "advanced": {"joy": 8, "energy": 4, "focus": 6, "buddy_xp": 36},
+        }
+        if activity_type == "break_return":
+            return {
+                "joy": 2,
+                "energy": 4,
+                "focus": 2,
+                "buddyXp": 8,
+                "message": "Bạn quay lại đúng nhịp nên Buddy hồi năng lượng và vui lên rõ rệt.",
+                "source": "break_return",
+            }
+        base = dict(bases[difficulty_key])
+        accuracy = 0 if total_questions <= 0 else correct_answers / total_questions
+        question_bonus = max(0, min(total_questions, 3) - 1)
+        base["joy"] += question_bonus
+        base["focus"] += question_bonus
+        base["buddy_xp"] += question_bonus * 6
+        if accuracy >= 1:
+            base["joy"] += 3
+            base["focus"] += 2
+            base["buddy_xp"] += 10
+        elif accuracy >= 0.67:
+            base["joy"] += 2
+            base["focus"] += 1
+            base["buddy_xp"] += 6
+        elif accuracy > 0:
+            base["joy"] += 1
+            base["buddy_xp"] += 3
+        if duration_seconds is not None and duration_seconds <= 90 and accuracy >= 0.67:
+            base["joy"] += 1
+            base["focus"] += 2
+            base["buddy_xp"] += 4
+        return {
+            "joy": base["joy"],
+            "energy": base["energy"],
+            "focus": base["focus"],
+            "buddyXp": base["buddy_xp"],
+            "message": "Buddy vừa nhận được một reward thật từ mini quiz của bạn.",
+            "source": "mini_quiz",
+        }
+
+    def apply_buddy_reward(
+        self,
+        user_id: str,
+        *,
+        activity_type: str,
+        difficulty: str = "beginner",
+        total_questions: int = 1,
+        correct_answers: int = 0,
+        duration_seconds: int | None = None,
+    ) -> dict[str, Any]:
+        settings = self.get_settings(user_id)
+        buddy_id = settings.get("active_buddy_id") or "miu"
+        current_state = self.get_buddy_state(user_id, buddy_id)
+        reward = self.calculate_buddy_reward(
+            activity_type=activity_type,
+            difficulty=difficulty,
+            total_questions=total_questions,
+            correct_answers=correct_answers,
+            duration_seconds=duration_seconds,
+        )
+        next_state = self.update_buddy_state(
+            user_id,
+            buddy_id,
+            {
+                "joy": current_state["joy"] + reward["joy"],
+                "energy": current_state["energy"] + reward["energy"],
+                "focus": current_state["focus"] + reward["focus"],
+            },
+        )
+        buddy_progress = self.update_buddy_progress(user_id, buddy_id, reward["buddyXp"])
+        updated_stats = self.update_stats(user_id, {"last_active_at": utc_now()})
+        active_buddy = self.active_buddy(user_id)
+        return {
+            "activeBuddy": active_buddy,
+            "buddyProgress": {
+                "level": buddy_progress.get("level", active_buddy.get("level")),
+                "totalXp": buddy_progress.get("xp", active_buddy.get("totalXp", 0)),
+            },
+            "buddyStats": next_state,
+            "gamification": self.gamification_rules(),
+            "reward": reward,
+            "userStats": self.format_stats_for_ui(updated_stats),
+        }
+
     def list_buddies_for_user(self, user_id: str) -> list[dict[str, Any]]:
         buddies = self.list_buddies()
         if self.use_postgres:
@@ -636,19 +949,21 @@ class AppStore:
                 )
         elif not self.use_supabase:
             user_buddy = next((row for row in self._user_buddies.get(user_id, []) if row["buddy_id"] == buddy["id"]), None)
+        buddy_state = self.get_buddy_state(user_id, buddy["id"])
+        buddy_progress = resolve_level_progress((user_buddy or {}).get("xp", 720))
         return {
             **buddy,
             "fallbackImage": buddy.get("fallbackImage") or buddy.get("avatar_url"),
-            "mood": buddy.get("mood") or buddy.get("default_mood", "idle"),
-            "level": (user_buddy or {}).get("level", 8),
-            "xp": (user_buddy or {}).get("xp", 720),
-            "nextLevelXp": 1200,
-            "energy": 76,
-            "focus": 68,
-            "motivation": 84,
+            "mood": buddy_state.get("mood") or buddy.get("mood") or buddy.get("default_mood", "idle"),
+            "level": buddy_progress["level"],
+            "xp": buddy_progress["xp_into_level"],
+            "totalXp": buddy_progress["total_xp"],
+            "nextLevelXp": buddy_progress["next_level_xp"],
+            "energy": buddy_state.get("energy", 76),
+            "focus": buddy_state.get("focus", 68),
+            "motivation": buddy_state.get("joy", 84),
             "quote": "Bạn đang tiến bộ tốt, làm thêm một quiz nữa nhé!",
         }
-
     def list_missions(self, user_id: str, mission_type: str | None = None) -> list[dict[str, Any]]:
         self.ensure_mission_rows(user_id)
         definitions = [mission for mission in MISSIONS if not mission_type or mission["type"] == mission_type]
@@ -907,7 +1222,6 @@ class AppStore:
         self.update_stats(user_id, {
             "xp": stats["xp"] + earned_xp,
             "coins": stats["coins"] + earned_coins,
-            "streak": max(1, stats.get("streak", 0)),
             "total_quizzes": stats.get("total_quizzes", 0) + 1,
             "total_correct_answers": stats.get("total_correct_answers", 0) + correct,
             "last_active_at": utc_now(),
@@ -1238,7 +1552,6 @@ class AppStore:
                     update user_stats
                     set xp = xp + %s,
                         coins = coins + %s,
-                        streak = greatest(1, streak),
                         total_quizzes = total_quizzes + 1,
                         total_correct_answers = total_correct_answers + %s,
                         last_active_at = now(),
@@ -1268,6 +1581,7 @@ class AppStore:
                 )
             connection.commit()
 
+        self.update_stats(user_id, {"last_active_at": utc_now()})
         return {
             "id": attempt_id,
             "attemptId": attempt_id,
@@ -1414,13 +1728,41 @@ class AppStore:
         self.update_stats(user_id, {"xp": stats["xp"] + achievement["reward_xp"], "coins": stats["coins"] + achievement["reward_coins"]})
         return self.format_achievement(achievement, row)
 
-    def list_models(self) -> list[dict[str, Any]]:
-        return [self.format_model(row) for row in COMPANION_MODELS if row.get("source") == "shop"]
+    def get_unlocked_model_ids(self, user_id: str) -> set[str]:
+        self.ensure_user_defaults(user_id)
+        if self.use_postgres:
+            rows = postgres_db.fetch_all(
+                "select model_id from user_unlocked_companion_models where user_id = %s::uuid",
+                (user_id,),
+            )
+            return {row["model_id"] for row in rows}
+        if self.use_supabase:
+            rows = self._table("user_unlocked_companion_models").select("model_id").eq("user_id", user_id).execute().data
+            return {row["model_id"] for row in rows}
+        return set(self._unlocked_models.get(user_id, set()))
 
-    def list_backgrounds(self) -> list[dict[str, Any]]:
-        return [self.format_background(row) for row in ROOM_BACKGROUNDS]
+    def get_unlocked_background_ids(self, user_id: str) -> set[str]:
+        self.ensure_user_defaults(user_id)
+        if self.use_postgres:
+            rows = postgres_db.fetch_all(
+                "select background_id from user_unlocked_room_backgrounds where user_id = %s::uuid",
+                (user_id,),
+            )
+            return {row["background_id"] for row in rows}
+        if self.use_supabase:
+            rows = self._table("user_unlocked_room_backgrounds").select("background_id").eq("user_id", user_id).execute().data
+            return {row["background_id"] for row in rows}
+        return set(self._unlocked_backgrounds.get(user_id, set()))
 
-    def format_model(self, row: dict[str, Any]) -> dict[str, Any]:
+    def list_models(self, user_id: str) -> list[dict[str, Any]]:
+        unlocked_ids = self.get_unlocked_model_ids(user_id)
+        return [self.format_model(row, unlocked=row["id"] in unlocked_ids) for row in COMPANION_MODELS if row.get("source") == "shop"]
+
+    def list_backgrounds(self, user_id: str) -> list[dict[str, Any]]:
+        unlocked_ids = self.get_unlocked_background_ids(user_id)
+        return [self.format_background(row, unlocked=row["id"] in unlocked_ids) for row in ROOM_BACKGROUNDS]
+
+    def format_model(self, row: dict[str, Any], *, unlocked: bool = True) -> dict[str, Any]:
         return {
             "id": row["id"],
             "name": row["name"],
@@ -1431,14 +1773,14 @@ class AppStore:
             "type": "vrm",
             "price": row["price"],
             "source": row.get("source", "shop"),
-            "unlocked": True,
+            "unlocked": unlocked,
             "vrmUrl": row["model_url"],
             "modelUrl": row["model_url"],
             "actions": row.get("actions", []),
             "accent": row.get("accent", "cyan"),
         }
 
-    def format_background(self, row: dict[str, Any]) -> dict[str, Any]:
+    def format_background(self, row: dict[str, Any], *, unlocked: bool = True) -> dict[str, Any]:
         return {
             "id": row["id"],
             "name": row["name"],
@@ -1447,31 +1789,122 @@ class AppStore:
             "thumbnailUrl": row["thumbnail_url"],
             "price": row["price"],
             "accent": row.get("accent", "cyan"),
-            "unlocked": True,
+            "unlocked": unlocked,
         }
 
     def equip_model(self, user_id: str, model_id: str) -> dict[str, Any]:
         model = next((item for item in COMPANION_MODELS if item["id"] == model_id), None)
         if not model:
             raise HTTPException(status_code=404, detail="3D model not found")
+        if model_id not in self.get_unlocked_model_ids(user_id):
+            raise HTTPException(status_code=403, detail="3D model is locked")
         return self.update_settings(user_id, {"equipped_model_id": model_id, "buddy_3d_enabled": True})
 
     def select_background(self, user_id: str, background_id: str) -> dict[str, Any]:
         background = next((item for item in ROOM_BACKGROUNDS if item["id"] == background_id), None)
         if not background:
             raise HTTPException(status_code=404, detail="Room background not found")
+        if background_id not in self.get_unlocked_background_ids(user_id):
+            raise HTTPException(status_code=403, detail="Room background is locked")
         return self.update_settings(user_id, {"room_background_id": background_id})
+
+    def purchase_model(self, user_id: str, model_id: str) -> dict[str, Any]:
+        model = next((item for item in COMPANION_MODELS if item["id"] == model_id and item.get("source") == "shop"), None)
+        if not model:
+            raise HTTPException(status_code=404, detail="3D model not found")
+        unlocked_ids = self.get_unlocked_model_ids(user_id)
+        if model_id in unlocked_ids:
+            return self.get_settings(user_id)
+
+        stats = self.get_stats(user_id)
+        cost = int(model.get("price", 0) or 0)
+        if stats["coins"] < cost:
+            raise HTTPException(status_code=400, detail="Not enough coins")
+
+        if self.use_postgres:
+            with postgres_db.connect() as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        insert into user_unlocked_companion_models (user_id, model_id, unlocked_at)
+                        values (%s::uuid, %s, now())
+                        on conflict (user_id, model_id) do nothing
+                        """,
+                        (user_id, model_id),
+                    )
+                    cursor.execute(
+                        """
+                        update user_stats
+                        set coins = greatest(0, coins - %s),
+                            updated_at = now()
+                        where user_id = %s::uuid
+                        """,
+                        (cost, user_id),
+                    )
+                connection.commit()
+            return self.get_settings(user_id)
+
+        if self.use_supabase:
+            self._table("user_unlocked_companion_models").insert({"user_id": user_id, "model_id": model_id, "unlocked_at": utc_now()}).execute()
+        else:
+            self._unlocked_models.setdefault(user_id, set()).add(model_id)
+        self.update_stats(user_id, {"coins": stats["coins"] - cost})
+        return self.get_settings(user_id)
+
+    def purchase_background(self, user_id: str, background_id: str) -> dict[str, Any]:
+        background = next((item for item in ROOM_BACKGROUNDS if item["id"] == background_id), None)
+        if not background:
+            raise HTTPException(status_code=404, detail="Room background not found")
+        unlocked_ids = self.get_unlocked_background_ids(user_id)
+        if background_id in unlocked_ids:
+            return self.get_settings(user_id)
+
+        stats = self.get_stats(user_id)
+        cost = int(background.get("price", 0) or 0)
+        if stats["coins"] < cost:
+            raise HTTPException(status_code=400, detail="Not enough coins")
+
+        if self.use_postgres:
+            with postgres_db.connect() as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        insert into user_unlocked_room_backgrounds (user_id, background_id, unlocked_at)
+                        values (%s::uuid, %s, now())
+                        on conflict (user_id, background_id) do nothing
+                        """,
+                        (user_id, background_id),
+                    )
+                    cursor.execute(
+                        """
+                        update user_stats
+                        set coins = greatest(0, coins - %s),
+                            updated_at = now()
+                        where user_id = %s::uuid
+                        """,
+                        (cost, user_id),
+                    )
+                connection.commit()
+            return self.get_settings(user_id)
+
+        if self.use_supabase:
+            self._table("user_unlocked_room_backgrounds").insert({"user_id": user_id, "background_id": background_id, "unlocked_at": utc_now()}).execute()
+        else:
+            self._unlocked_backgrounds.setdefault(user_id, set()).add(background_id)
+        self.update_stats(user_id, {"coins": stats["coins"] - cost})
+        return self.get_settings(user_id)
 
     def progress_summary(self, user_id: str) -> dict[str, Any]:
         stats = self.get_stats(user_id)
         return self.progress_summary_from_stats(stats)
 
     def progress_summary_from_stats(self, stats: dict[str, Any]) -> dict[str, Any]:
+        stats = self.normalize_stats_row(stats)
         total_quizzes = stats.get("total_quizzes", 0)
         total_questions = max(1, total_quizzes * 3)
         return {
             "level": stats["level"],
-            "xp": stats["xp"],
+            "xp": resolve_level_progress(stats["xp"])["xp_into_level"],
             "coins": stats["coins"],
             "streak": stats["streak"],
             "totalQuizzes": total_quizzes,
@@ -1621,11 +2054,13 @@ class AppStore:
         }
 
     def format_stats_for_ui(self, stats: dict[str, Any], progress_summary: dict[str, Any] | None = None) -> dict[str, Any]:
+        stats = self.normalize_stats_row(stats)
+        level_progress = resolve_level_progress(stats["xp"])
         progress_summary = progress_summary or self.progress_summary_from_stats(stats)
         return {
             "level": stats["level"],
-            "xp": stats["xp"],
-            "nextLevelXp": next_level_xp(stats["level"]),
+            "xp": level_progress["xp_into_level"],
+            "nextLevelXp": level_progress["next_level_xp"],
             "totalXp": stats["xp"],
             "streak": stats["streak"],
             "coins": stats["coins"],
