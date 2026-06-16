@@ -9,6 +9,7 @@ from typing import Any
 from uuid import uuid4
 
 from fastapi import HTTPException, status
+from psycopg.errors import UndefinedTable
 
 from backend.core.security import hash_password, verify_password
 from backend.database.connection import postgres_db, supabase
@@ -52,8 +53,8 @@ def initials(name: str) -> str:
 
 
 def next_level_xp(level: int) -> int:
-    safe_level = max(1, level)
-    return 120 + (safe_level - 1) * 55
+    safe_level = max(0, level)
+    return 120 + safe_level * 55
 
 
 def clamp(value: int, minimum: int = 0, maximum: int = 100) -> int:
@@ -75,7 +76,7 @@ def parse_iso_datetime(value: Any) -> datetime | None:
 
 def resolve_level_progress(total_xp: int) -> dict[str, int]:
     safe_total_xp = max(0, int(total_xp))
-    level = 1
+    level = 0
     xp_into_level = safe_total_xp
     while xp_into_level >= next_level_xp(level):
         xp_into_level -= next_level_xp(level)
@@ -128,6 +129,21 @@ def calculate_streak(previous_streak: int, previous_last_active_at: Any, next_la
     return 1
 
 
+def resolve_streak_at_reference(previous_streak: int, previous_last_active_at: Any, reference_at: Any) -> int:
+    reference = parse_iso_datetime(reference_at)
+    if not reference:
+        return max(0, previous_streak or 0)
+
+    previous_active_at = parse_iso_datetime(previous_last_active_at)
+    if not previous_active_at:
+        return 0
+
+    day_delta = (reference.date() - previous_active_at.date()).days
+    if day_delta <= 1:
+        return max(0, previous_streak or 0)
+    return 0
+
+
 def json_value(value: Any) -> Any:
     if hasattr(value, "as_string"):
         return value.as_string()
@@ -158,6 +174,7 @@ class AppStore:
         self._user_achievements: dict[str, list[dict[str, Any]]] = {}
         self._buddies_cache: list[dict[str, Any]] | None = None
         self._email_verification_otps: list[dict[str, Any]] = []
+        self._postgres_table_exists_cache: dict[str, bool] = {}
 
     @property
     def use_postgres(self) -> bool:
@@ -166,6 +183,26 @@ class AppStore:
     @property
     def use_supabase(self) -> bool:
         return supabase is not None and not self.use_postgres
+
+    def postgres_table_exists(self, table_name: str) -> bool:
+        if not self.use_postgres:
+            return False
+        if table_name in self._postgres_table_exists_cache:
+            return self._postgres_table_exists_cache[table_name]
+
+        row = postgres_db.fetch_one(
+            """
+            select exists (
+              select 1
+              from information_schema.tables
+              where table_schema = 'public' and table_name = %s
+            ) as exists
+            """,
+            (table_name,),
+        )
+        exists = bool(row["exists"]) if row else False
+        self._postgres_table_exists_cache[table_name] = exists
+        return exists
 
     def _table(self, table: str):
         if not supabase:
@@ -471,11 +508,11 @@ class AppStore:
                 row = postgres_db.fetch_one("select * from user_stats where user_id = %s::uuid", (user_id,))
             if not row:
                 raise HTTPException(status_code=404, detail="User stats not found")
-            return self.normalize_stats_row(dict(row))
+            return self.sync_streak_for_reference(user_id, self.normalize_stats_row(dict(row)))
         if self.use_supabase:
             rows = self._table("user_stats").select("*").eq("user_id", user_id).execute().data
-            return self.normalize_stats_row(rows[0])
-        return self.normalize_stats_row(self._stats[user_id])
+            return self.sync_streak_for_reference(user_id, self.normalize_stats_row(rows[0]))
+        return self.sync_streak_for_reference(user_id, self.normalize_stats_row(self._stats[user_id]))
 
     def update_stats(self, user_id: str, patch: dict[str, Any]) -> dict[str, Any]:
         current = self.get_stats(user_id)
@@ -516,6 +553,26 @@ class AppStore:
         next_row["level"] = progress["level"]
         return next_row
 
+    def sync_streak_for_reference(self, user_id: str, stats: dict[str, Any], reference_at: Any | None = None) -> dict[str, Any]:
+        resolved_streak = resolve_streak_at_reference(stats.get("streak", 0), stats.get("last_active_at"), reference_at or utc_now())
+        if resolved_streak == stats.get("streak", 0):
+            return stats
+
+        patch = {"streak": resolved_streak}
+        if self.use_postgres:
+            postgres_db.execute(
+                "update user_stats set streak = %s, updated_at = now() where user_id = %s::uuid",
+                (resolved_streak, user_id),
+            )
+            refreshed = postgres_db.fetch_one("select * from user_stats where user_id = %s::uuid", (user_id,))
+            return self.normalize_stats_row(dict(refreshed)) if refreshed else self.normalize_stats_row({**stats, **patch})
+        if self.use_supabase:
+            self._table("user_stats").update(patch).eq("user_id", user_id).execute()
+            return self.normalize_stats_row({**stats, **patch})
+
+        self._stats[user_id] = {**self._stats[user_id], **patch, "updated_at": utc_now()}
+        return self.normalize_stats_row(self._stats[user_id])
+
     def _ensure_user_defaults_postgres(self, user_id: str, cursor: Any) -> None:
         cursor.execute(
             """
@@ -542,7 +599,7 @@ class AppStore:
             """,
             (user_id, "miu", "cozy-night"),
         )
-        buddy_rows = [(user_id, buddy["id"], buddy["id"] == "miu", 8 if buddy["id"] == "miu" else 1, 720 if buddy["id"] == "miu" else 0) for buddy in BUDDIES]
+        buddy_rows = [(user_id, buddy["id"], buddy["id"] == "miu", 0, 0) for buddy in BUDDIES]
         if buddy_rows:
             values_sql = ", ".join(["(%s::uuid, %s, %s, %s, %s, now(), now())"] * len(buddy_rows))
             params = tuple(value for row in buddy_rows for value in row)
@@ -554,20 +611,21 @@ class AppStore:
                 """,
                 params,
             )
-            buddy_state_rows = []
-            for buddy in BUDDIES:
-                state = default_buddy_state(buddy)
-                buddy_state_rows.append((user_id, buddy["id"], state["joy"], state["energy"], state["focus"], state["mood"]))
-            values_sql = ", ".join(["(%s::uuid, %s, %s, %s, %s, %s, now())"] * len(buddy_state_rows))
-            params = tuple(value for row in buddy_state_rows for value in row)
-            cursor.execute(
-                f"""
-                insert into user_buddy_states (user_id, buddy_id, joy, energy, focus, mood, updated_at)
-                values {values_sql}
-                on conflict (user_id, buddy_id) do nothing
-                """,
-                params,
-            )
+            if self.postgres_table_exists("user_buddy_states"):
+                buddy_state_rows = []
+                for buddy in BUDDIES:
+                    state = default_buddy_state(buddy)
+                    buddy_state_rows.append((user_id, buddy["id"], state["joy"], state["energy"], state["focus"], state["mood"]))
+                values_sql = ", ".join(["(%s::uuid, %s, %s, %s, %s, %s, now())"] * len(buddy_state_rows))
+                params = tuple(value for row in buddy_state_rows for value in row)
+                cursor.execute(
+                    f"""
+                    insert into user_buddy_states (user_id, buddy_id, joy, energy, focus, mood, updated_at)
+                    values {values_sql}
+                    on conflict (user_id, buddy_id) do nothing
+                    """,
+                    params,
+                )
 
         scope = today_scope()
         cursor.execute("select mission_id, date_scope from user_missions where user_id = %s::uuid", (user_id,))
@@ -627,7 +685,7 @@ class AppStore:
         )
         if user_id not in self._user_buddies:
             self._user_buddies[user_id] = [
-                {"id": str(uuid4()), "user_id": user_id, "buddy_id": buddy["id"], "is_selected": buddy["id"] == "miu", "level": 8, "xp": 720, "created_at": utc_now(), "updated_at": utc_now()}
+                {"id": str(uuid4()), "user_id": user_id, "buddy_id": buddy["id"], "is_selected": buddy["id"] == "miu", "level": 0, "xp": 0, "created_at": utc_now(), "updated_at": utc_now()}
                 for buddy in BUDDIES
             ]
         self._buddy_states.setdefault(
@@ -738,10 +796,16 @@ class AppStore:
             "updated_at": utc_now(),
         }
         if self.use_postgres:
-            row = postgres_db.fetch_one(
-                "select * from user_buddy_states where user_id = %s::uuid and buddy_id = %s",
-                (user_id, buddy_id),
-            )
+            if not self.postgres_table_exists("user_buddy_states"):
+                return fallback
+            try:
+                row = postgres_db.fetch_one(
+                    "select * from user_buddy_states where user_id = %s::uuid and buddy_id = %s",
+                    (user_id, buddy_id),
+                )
+            except UndefinedTable:
+                self._postgres_table_exists_cache["user_buddy_states"] = False
+                return fallback
             return {**fallback, **(dict(row) if row else {})}
         if self.use_supabase:
             rows = self._table("user_buddy_states").select("*").eq("user_id", user_id).eq("buddy_id", buddy_id).execute().data
@@ -761,20 +825,26 @@ class AppStore:
         }
         next_row["mood"] = patch.get("mood") or resolve_buddy_mood(next_row["joy"], next_row["energy"], next_row["focus"])
         if self.use_postgres:
-            postgres_db.execute(
-                """
-                insert into user_buddy_states (user_id, buddy_id, joy, energy, focus, mood, updated_at)
-                values (%s::uuid, %s, %s, %s, %s, %s, now())
-                on conflict (user_id, buddy_id)
-                do update set
-                    joy = excluded.joy,
-                    energy = excluded.energy,
-                    focus = excluded.focus,
-                    mood = excluded.mood,
-                    updated_at = now()
-                """,
-                (user_id, buddy_id, next_row["joy"], next_row["energy"], next_row["focus"], next_row["mood"]),
-            )
+            if not self.postgres_table_exists("user_buddy_states"):
+                return next_row
+            try:
+                postgres_db.execute(
+                    """
+                    insert into user_buddy_states (user_id, buddy_id, joy, energy, focus, mood, updated_at)
+                    values (%s::uuid, %s, %s, %s, %s, %s, now())
+                    on conflict (user_id, buddy_id)
+                    do update set
+                        joy = excluded.joy,
+                        energy = excluded.energy,
+                        focus = excluded.focus,
+                        mood = excluded.mood,
+                        updated_at = now()
+                    """,
+                    (user_id, buddy_id, next_row["joy"], next_row["energy"], next_row["focus"], next_row["mood"]),
+                )
+            except UndefinedTable:
+                self._postgres_table_exists_cache["user_buddy_states"] = False
+                return next_row
             return self.get_buddy_state(user_id, buddy_id)
         if self.use_supabase:
             self._table("user_buddy_states").upsert(next_row).execute()
@@ -825,7 +895,7 @@ class AppStore:
             "streaks": {
                 "sameDay": "Giữ nguyên streak",
                 "nextDay": "Tăng streak thêm 1",
-                "missedDay": "Reset về 1",
+                "missedDay": "Reset về 0, đăng nhập lại sẽ bắt đầu từ 1",
             },
             "miniQuizRewards": {
                 "beginner": {"joy": 3, "energy": 2, "focus": 1},
@@ -950,7 +1020,7 @@ class AppStore:
         elif not self.use_supabase:
             user_buddy = next((row for row in self._user_buddies.get(user_id, []) if row["buddy_id"] == buddy["id"]), None)
         buddy_state = self.get_buddy_state(user_id, buddy["id"])
-        buddy_progress = resolve_level_progress((user_buddy or {}).get("xp", 720))
+        buddy_progress = resolve_level_progress((user_buddy or {}).get("xp", 0))
         return {
             **buddy,
             "fallbackImage": buddy.get("fallbackImage") or buddy.get("avatar_url"),

@@ -92,6 +92,7 @@ def login(email: str, password: str) -> dict[str, object]:
             details["verification_session_id"] = str(latest["verification_session_id"])
             details["email"] = user["email"]
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=details)
+    store.update_stats(str(user["id"]), {"last_active_at": now_utc().isoformat()})
     return issue_token(user)
 
 

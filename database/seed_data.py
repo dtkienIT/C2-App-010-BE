@@ -24,7 +24,7 @@ DEFAULT_STATS = {
 }
 
 NEW_USER_STATS = {
-    "level": 1,
+    "level": 0,
     "xp": 0,
     "coins": 0,
     "streak": 0,
