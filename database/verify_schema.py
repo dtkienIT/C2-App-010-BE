@@ -19,6 +19,11 @@ EXPECTED_TABLES = [
     "quiz_attempt_answers",
     "achievements",
     "user_achievements",
+    "web_push_subscriptions",
+    "study_reminders",
+    "notification_outbox",
+    "notification_deliveries",
+    "notification_email_deliveries",
 ]
 
 

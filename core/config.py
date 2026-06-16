@@ -1,6 +1,10 @@
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+ROOT_DIR = Path(__file__).resolve().parents[2]
+ROOT_ENV_FILE = ROOT_DIR / ".env"
 
 
 class Settings(BaseSettings):
@@ -17,8 +21,36 @@ class Settings(BaseSettings):
     newsfeed_cache_ttl_minutes: int = 20
     newsfeed_request_timeout_seconds: int = 8
     postgres_pool_max_size: int = 8
+    environment: str = "development"
+    vite_enable_web_push: bool = True
+    vite_enable_notification_test: bool = False
+    vite_web_push_public_key: str = ""
+    web_push_enabled: bool = False
+    web_push_vapid_public_key: str = ""
+    web_push_vapid_private_key: str = ""
+    web_push_vapid_subject: str = "mailto:team@example.com"
+    notification_worker_poll_seconds: int = 10
+    notification_worker_batch_size: int = 50
+    notification_worker_embedded_enabled: bool = True
+    notification_max_attempts: int = 5
+    notification_max_lateness_seconds: int = 1800
+    web_push_ttl_seconds: int = 3600
+    notification_test_cooldown_seconds: int = 60
+    enable_notification_test_endpoint: bool = False
+    max_study_reminders_per_user: int = 12
+    email_notifications_enabled: bool = False
+    frontend_base_url: str = "http://localhost:5173"
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_username: str = ""
+    smtp_password: str = ""
+    smtp_from_email: str = ""
+    smtp_from_name: str = "Study Buddy"
+    smtp_use_tls: bool = True
+    smtp_use_ssl: bool = False
+    smtp_timeout_seconds: int = 10
 
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(env_file=str(ROOT_ENV_FILE), env_file_encoding="utf-8", extra="ignore")
 
     @property
     def cors_origins_list(self) -> list[str]:
