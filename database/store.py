@@ -111,6 +111,11 @@ def default_buddy_state(buddy: dict[str, Any] | None = None) -> dict[str, Any]:
     }
 
 
+def table_missing_error(error: Exception, table_name: str) -> bool:
+    message = str(error).lower()
+    return isinstance(error, UndefinedTable) or table_name.lower() in message
+
+
 def calculate_streak(previous_streak: int, previous_last_active_at: Any, next_last_active_at: Any) -> int:
     next_active_at = parse_iso_datetime(next_last_active_at)
     if not next_active_at:
@@ -626,6 +631,15 @@ class AppStore:
                     """,
                     params,
                 )
+        if self.postgres_table_exists("user_unlocked_room_backgrounds"):
+            cursor.execute(
+                """
+                insert into user_unlocked_room_backgrounds (user_id, background_id, unlocked_at)
+                values (%s::uuid, %s, now())
+                on conflict (user_id, background_id) do nothing
+                """,
+                (user_id, "cozy-night"),
+            )
 
         scope = today_scope()
         cursor.execute("select mission_id, date_scope from user_missions where user_id = %s::uuid", (user_id,))
@@ -1801,11 +1815,19 @@ class AppStore:
     def get_unlocked_model_ids(self, user_id: str) -> set[str]:
         self.ensure_user_defaults(user_id)
         if self.use_postgres:
-            rows = postgres_db.fetch_all(
-                "select model_id from user_unlocked_companion_models where user_id = %s::uuid",
-                (user_id,),
-            )
-            return {row["model_id"] for row in rows}
+            if not self.postgres_table_exists("user_unlocked_companion_models"):
+                return set()
+            try:
+                rows = postgres_db.fetch_all(
+                    "select model_id from user_unlocked_companion_models where user_id = %s::uuid",
+                    (user_id,),
+                )
+                return {row["model_id"] for row in rows}
+            except Exception as error:
+                if table_missing_error(error, "user_unlocked_companion_models"):
+                    self._postgres_table_exists_cache["user_unlocked_companion_models"] = False
+                    return set()
+                raise
         if self.use_supabase:
             rows = self._table("user_unlocked_companion_models").select("model_id").eq("user_id", user_id).execute().data
             return {row["model_id"] for row in rows}
@@ -1814,11 +1836,21 @@ class AppStore:
     def get_unlocked_background_ids(self, user_id: str) -> set[str]:
         self.ensure_user_defaults(user_id)
         if self.use_postgres:
-            rows = postgres_db.fetch_all(
-                "select background_id from user_unlocked_room_backgrounds where user_id = %s::uuid",
-                (user_id,),
-            )
-            return {row["background_id"] for row in rows}
+            if not self.postgres_table_exists("user_unlocked_room_backgrounds"):
+                return {"cozy-night"}
+            try:
+                rows = postgres_db.fetch_all(
+                    "select background_id from user_unlocked_room_backgrounds where user_id = %s::uuid",
+                    (user_id,),
+                )
+                unlocked_ids = {row["background_id"] for row in rows}
+                unlocked_ids.add("cozy-night")
+                return unlocked_ids
+            except Exception as error:
+                if table_missing_error(error, "user_unlocked_room_backgrounds"):
+                    self._postgres_table_exists_cache["user_unlocked_room_backgrounds"] = False
+                    return {"cozy-night"}
+                raise
         if self.use_supabase:
             rows = self._table("user_unlocked_room_backgrounds").select("background_id").eq("user_id", user_id).execute().data
             return {row["background_id"] for row in rows}
@@ -1892,6 +1924,8 @@ class AppStore:
             raise HTTPException(status_code=400, detail="Not enough coins")
 
         if self.use_postgres:
+            if not self.postgres_table_exists("user_unlocked_companion_models"):
+                raise HTTPException(status_code=503, detail="3D model unlocks are unavailable until the shop schema is installed")
             with postgres_db.connect() as connection:
                 with connection.cursor() as cursor:
                     cursor.execute(
@@ -1935,6 +1969,8 @@ class AppStore:
             raise HTTPException(status_code=400, detail="Not enough coins")
 
         if self.use_postgres:
+            if not self.postgres_table_exists("user_unlocked_room_backgrounds"):
+                raise HTTPException(status_code=503, detail="Room background unlocks are unavailable until the shop schema is installed")
             with postgres_db.connect() as connection:
                 with connection.cursor() as cursor:
                     cursor.execute(
