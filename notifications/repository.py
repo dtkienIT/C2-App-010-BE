@@ -8,6 +8,7 @@ from typing import Any
 from uuid import uuid4
 
 from backend.database.connection import postgres_db
+from psycopg.errors import UndefinedTable
 from backend.notifications.constants import (
     DAILY_STUDY_REMINDER,
     DELIVERY_PENDING,
@@ -22,6 +23,7 @@ from backend.notifications.constants import (
     OUTBOX_PROCESSING,
     OUTBOX_SENT,
     OUTBOX_SKIPPED,
+    USER_NOTIFICATION_STORED,
 )
 from backend.notifications.reminder_time import calculate_next_run, parse_reminder_time
 
@@ -59,6 +61,7 @@ class NotificationRepository:
         self._outbox: dict[str, dict[str, Any]] = {}
         self._deliveries: dict[str, dict[str, Any]] = {}
         self._email_deliveries: dict[str, dict[str, Any]] = {}
+        self._user_notifications: dict[str, dict[str, Any]] = {}
         self._profiles: dict[str, dict[str, Any]] = {}
 
     @property
@@ -674,6 +677,128 @@ class NotificationRepository:
             and as_utc(row["processed_at"]) >= since
         ]
         rows.sort(key=lambda row: (row["processed_at"], row["created_at"]), reverse=True)
+        return rows[:limit]
+
+    def purge_expired_user_notifications(self, *, user_id: str | None = None, now_utc: datetime | None = None) -> int:
+        now = as_utc(now_utc or utc_now())
+        if self.use_postgres:
+            try:
+                if user_id:
+                    with postgres_db.connect() as connection:
+                        with connection.cursor() as cursor:
+                            cursor.execute(
+                                """
+                                delete from user_notifications
+                                where user_id = %s::uuid
+                                  and expires_at <= %s
+                                """,
+                                (user_id, now),
+                            )
+                            deleted_count = cursor.rowcount or 0
+                        connection.commit()
+                    return deleted_count
+
+                with postgres_db.connect() as connection:
+                    with connection.cursor() as cursor:
+                        cursor.execute(
+                            """
+                            delete from user_notifications
+                            where expires_at <= %s
+                            """,
+                            (now,),
+                        )
+                        deleted_count = cursor.rowcount or 0
+                    connection.commit()
+                return deleted_count
+            except UndefinedTable:
+                return 0
+
+        expired_ids = [
+            notification_id
+            for notification_id, row in self._user_notifications.items()
+            if (user_id is None or row["user_id"] == user_id) and as_utc(row["expires_at"]) <= now
+        ]
+        for notification_id in expired_ids:
+            self._user_notifications.pop(notification_id, None)
+        return len(expired_ids)
+
+    def create_user_notification(
+        self,
+        *,
+        user_id: str,
+        event_type: str,
+        payload: dict[str, Any],
+        expires_at: datetime | None = None,
+    ) -> dict[str, Any]:
+        now = as_utc(utc_now())
+        expires_at = as_utc(expires_at or (now + timedelta(days=15)))
+        next_payload = deepcopy(payload)
+        next_payload.setdefault("createdAt", now.isoformat())
+        next_payload.setdefault("expiresAt", expires_at.isoformat())
+        self.purge_expired_user_notifications(user_id=user_id, now_utc=now)
+
+        if self.use_postgres:
+            try:
+                row = postgres_db.execute_returning(
+                    """
+                    insert into user_notifications (
+                      id, user_id, event_type, status, payload, expires_at, created_at, updated_at
+                    )
+                    values (%s::uuid, %s::uuid, %s, %s, %s::jsonb, %s, now(), now())
+                    returning *
+                    """,
+                    (
+                        str(uuid4()),
+                        user_id,
+                        event_type,
+                        USER_NOTIFICATION_STORED,
+                        to_jsonb(next_payload),
+                        expires_at,
+                    ),
+                )
+                return normalize_row(row) or {}
+            except UndefinedTable:
+                return {}
+
+        row = {
+            "id": str(uuid4()),
+            "user_id": user_id,
+            "event_type": event_type,
+            "status": USER_NOTIFICATION_STORED,
+            "payload": next_payload,
+            "expires_at": expires_at,
+            "created_at": now,
+            "updated_at": now,
+        }
+        self._user_notifications[row["id"]] = row
+        return deepcopy(row)
+
+    def list_user_notifications(self, *, user_id: str, limit: int = 20, now_utc: datetime | None = None) -> list[dict[str, Any]]:
+        now = as_utc(now_utc or utc_now())
+        self.purge_expired_user_notifications(user_id=user_id, now_utc=now)
+        if self.use_postgres:
+            try:
+                rows = postgres_db.fetch_all(
+                    """
+                    select *
+                    from user_notifications
+                    where user_id = %s::uuid
+                      and expires_at > %s
+                    order by created_at desc
+                    limit %s
+                    """,
+                    (user_id, now, limit),
+                )
+                return [normalize_row(row) or {} for row in rows]
+            except UndefinedTable:
+                return []
+
+        rows = [
+            deepcopy(row)
+            for row in self._user_notifications.values()
+            if row["user_id"] == user_id and as_utc(row["expires_at"]) > now
+        ]
+        rows.sort(key=lambda row: (row["created_at"], row["id"]), reverse=True)
         return rows[:limit]
 
     def claim_due_outbox(self, *, limit: int, worker_id: str, now_utc: datetime | None = None) -> list[dict[str, Any]]:

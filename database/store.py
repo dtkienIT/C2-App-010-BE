@@ -1946,6 +1946,16 @@ class AppStore:
                         (cost, user_id),
                     )
                 connection.commit()
+            from backend.notifications.service import create_unlock_notification
+
+            create_unlock_notification(
+                user_id,
+                item_name=str(model.get("name") or model_id),
+                item_kind="model",
+                cost=cost,
+                target_url="/buddy-3d",
+                image_url=model.get("thumbnail_url"),
+            )
             return self.get_settings(user_id)
 
         if self.use_supabase:
@@ -1953,6 +1963,16 @@ class AppStore:
         else:
             self._unlocked_models.setdefault(user_id, set()).add(model_id)
         self.update_stats(user_id, {"coins": stats["coins"] - cost})
+        from backend.notifications.service import create_unlock_notification
+
+        create_unlock_notification(
+            user_id,
+            item_name=str(model.get("name") or model_id),
+            item_kind="model",
+            cost=cost,
+            target_url="/buddy-3d",
+            image_url=model.get("thumbnail_url"),
+        )
         return self.get_settings(user_id)
 
     def purchase_background(self, user_id: str, background_id: str) -> dict[str, Any]:
@@ -1991,6 +2011,16 @@ class AppStore:
                         (cost, user_id),
                     )
                 connection.commit()
+            from backend.notifications.service import create_unlock_notification
+
+            create_unlock_notification(
+                user_id,
+                item_name=str(background.get("name") or background_id),
+                item_kind="background",
+                cost=cost,
+                target_url="/buddy-room",
+                image_url=background.get("thumbnail_url") or background.get("image_url"),
+            )
             return self.get_settings(user_id)
 
         if self.use_supabase:
@@ -1998,6 +2028,16 @@ class AppStore:
         else:
             self._unlocked_backgrounds.setdefault(user_id, set()).add(background_id)
         self.update_stats(user_id, {"coins": stats["coins"] - cost})
+        from backend.notifications.service import create_unlock_notification
+
+        create_unlock_notification(
+            user_id,
+            item_name=str(background.get("name") or background_id),
+            item_kind="background",
+            cost=cost,
+            target_url="/buddy-room",
+            image_url=background.get("thumbnail_url") or background.get("image_url"),
+        )
         return self.get_settings(user_id)
 
     def progress_summary(self, user_id: str) -> dict[str, Any]:

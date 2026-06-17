@@ -8,6 +8,7 @@ from fastapi import HTTPException, status
 
 from backend.core.config import settings
 from backend.notifications.repository import NotificationRepository, build_payload, repository, utc_now
+from backend.notifications.constants import SHOP_UNLOCK_NOTIFICATION, SHOP_UNLOCK_NOTIFICATION_TYPE
 from backend.notifications.schemas import StudyReminderCreateRequest, StudyReminderUpdateRequest
 
 _test_cooldowns: dict[str, datetime] = {}
@@ -95,6 +96,43 @@ def format_recent_notification(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def create_unlock_notification(
+    user_id: str,
+    *,
+    item_name: str,
+    item_kind: str,
+    cost: int,
+    target_url: str,
+    image_url: str | None = None,
+    repo: NotificationRepository = repository,
+) -> dict[str, Any]:
+    item_kind_label = {
+        "background": "background",
+        "buddy": "Buddy",
+        "model": "model",
+    }.get(item_kind, item_kind)
+    title = f"Chúc mừng bạn đã mở khóa {item_name}!"
+    body = f"Bạn vừa mở khóa {item_kind_label} {item_name} thành công với {cost} xu."
+    payload = {
+        "type": SHOP_UNLOCK_NOTIFICATION_TYPE,
+        "title": title,
+        "body": body,
+        "targetUrl": target_url,
+        "icon": image_url or "/logo192.png",
+        "metadata": {
+            "cost": cost,
+            "itemKind": item_kind,
+            "itemName": item_name,
+        },
+    }
+    row = repo.create_user_notification(
+        user_id=user_id,
+        event_type=SHOP_UNLOCK_NOTIFICATION,
+        payload=payload,
+    )
+    return format_recent_notification(row) if row else {}
+
+
 def register_subscription(
     *,
     user_id: str,
@@ -136,9 +174,15 @@ def list_reminders(user_id: str, repo: NotificationRepository = repository) -> l
 
 
 def list_recent_notifications(user_id: str, repo: NotificationRepository = repository) -> list[dict[str, Any]]:
-    since = utc_now() - timedelta(minutes=15)
-    rows = repo.list_recent_delivered_outbox(user_id=user_id, limit=10, since=since)
-    return [format_recent_notification(row) for row in rows]
+    since = utc_now() - timedelta(days=15)
+    stored_rows = repo.list_user_notifications(user_id=user_id, limit=20)
+    reminder_rows = repo.list_recent_delivered_outbox(user_id=user_id, limit=20, since=since)
+    rows = [format_recent_notification(row) for row in [*stored_rows, *reminder_rows]]
+    rows.sort(
+        key=lambda row: row.get("payload", {}).get("createdAt") or row.get("processedAt") or "",
+        reverse=True,
+    )
+    return rows[:20]
 
 
 def create_reminder(user_id: str, payload: StudyReminderCreateRequest, repo: NotificationRepository = repository) -> dict[str, Any]:
