@@ -22,6 +22,9 @@ class Settings(BaseSettings):
     newsfeed_request_timeout_seconds: int = 8
     postgres_pool_max_size: int = 8
     environment: str = "development"
+    mistral_api_key: str = ""
+    mistral_model: str = "mistral-small-latest"
+    mistral_api_base: str = "https://api.mistral.ai"
     vite_enable_web_push: bool = True
     vite_enable_notification_test: bool = False
     vite_web_push_public_key: str = ""
