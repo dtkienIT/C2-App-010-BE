@@ -8,8 +8,10 @@ class QuizAnswer(BaseModel):
 
 class QuizAttemptCreate(BaseModel):
     answers: list[QuizAnswer]
+    submissionToken: str | None = None
 
 
 class GeneratedQuizAttemptCreate(BaseModel):
     quizId: str
     answers: list[QuizAnswer]
+    submissionToken: str | None = None

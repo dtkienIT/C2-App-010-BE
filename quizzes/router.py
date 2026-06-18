@@ -32,7 +32,7 @@ def generate_quiz(
 @router.post("/generated/attempts")
 def submit_generated_attempt(payload: GeneratedQuizAttemptCreate, user_id: str = Depends(get_current_user_id)):
     answers = [answer.model_dump() for answer in payload.answers]
-    return ok(service.submit_generated_attempt(user_id, payload.quizId, answers))
+    return ok(service.submit_generated_attempt(user_id, payload.quizId, answers, payload.submissionToken))
 
 
 @router.get("/{quiz_id}")
@@ -43,4 +43,4 @@ def get_quiz(quiz_id: str, _user_id: str = Depends(get_current_user_id)):
 @router.post("/{quiz_id}/attempts")
 def submit_attempt(quiz_id: str, payload: QuizAttemptCreate, user_id: str = Depends(get_current_user_id)):
     answers = [answer.model_dump() for answer in payload.answers]
-    return ok(service.submit_attempt(user_id, quiz_id, answers))
+    return ok(service.submit_attempt(user_id, quiz_id, answers, payload.submissionToken))

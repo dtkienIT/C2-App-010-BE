@@ -3,14 +3,17 @@
 from copy import deepcopy
 from datetime import date, datetime, timedelta, timezone
 import json
+import logging
 import random
 import re
 from typing import Any
 from uuid import uuid4
 
 from fastapi import HTTPException, status
+import jwt
 from psycopg.errors import UndefinedTable
 
+from backend.core.config import settings
 from backend.core.security import hash_password, verify_password
 from backend.database.connection import postgres_db, supabase
 from backend.database.seed_data import (
@@ -24,6 +27,7 @@ from backend.database.seed_data import (
 )
 
 STREAK_DAILY_COIN_REWARD = 15
+logger = logging.getLogger(__name__)
 
 
 def utc_now() -> str:
@@ -220,6 +224,7 @@ class AppStore:
         self._user_achievements: dict[str, list[dict[str, Any]]] = {}
         self._buddies_cache: list[dict[str, Any]] | None = None
         self._email_verification_otps: list[dict[str, Any]] = []
+        self._generated_quiz_sessions: dict[str, dict[str, Any]] = {}
         self._postgres_table_exists_cache: dict[str, bool] = {}
         self._postgres_column_exists_cache: dict[tuple[str, str], bool] = {}
 
@@ -571,7 +576,24 @@ class AppStore:
         return self._users[user_id]
 
     def get_stats(self, user_id: str) -> dict[str, Any]:
-        return self.get_stats_with_daily_check_in(user_id)["stats"]
+        if self.use_postgres:
+            with postgres_db.connect() as connection:
+                with connection.cursor() as cursor:
+                    self._ensure_user_defaults_postgres(user_id, cursor)
+                    cursor.execute("select * from user_stats where user_id = %s::uuid", (user_id,))
+                    row = cursor.fetchone()
+                    if not row:
+                        raise HTTPException(status_code=404, detail="User stats not found")
+                connection.commit()
+            return self.normalize_stats_row(dict(row))
+        if self.use_supabase:
+            self.ensure_user_defaults(user_id)
+            rows = self._table("user_stats").select("*").eq("user_id", user_id).execute().data
+            if not rows:
+                raise HTTPException(status_code=404, detail="User stats not found")
+            return self.normalize_stats_row(rows[0])
+        self.ensure_user_defaults(user_id)
+        return self.normalize_stats_row(self._stats[user_id])
 
     def get_stats_with_daily_check_in(self, user_id: str, reference_at: Any | None = None) -> dict[str, Any]:
         daily_result = self.apply_daily_check_in(user_id, reference_at=reference_at)
@@ -1472,13 +1494,20 @@ class AppStore:
             ],
         }
 
-    def submit_attempt(self, user_id: str, quiz_id: str, answers: list[dict[str, str]]) -> dict[str, Any]:
+    def submit_attempt(self, user_id: str, quiz_id: str, answers: list[dict[str, str]], submission_token: str | None = None) -> dict[str, Any]:
         if self.use_postgres:
-            return self.submit_generated_attempt(user_id, quiz_id, answers)
+            return self.submit_quiz_session_attempt(user_id, quiz_id, answers, submission_token)
 
         quiz = next((quiz for quiz in QUIZZES if quiz["id"] == quiz_id), None)
         if not quiz:
-            raise HTTPException(status_code=404, detail="Quiz not found")
+            raise HTTPException(
+                status_code=status.HTTP_410_GONE,
+                detail={
+                    "message": "Quiz session expired. Please generate a new quiz before submitting.",
+                    "code": "QUIZ_SESSION_EXPIRED",
+                    "quizId": quiz_id,
+                },
+            )
         answer_map = {answer["questionId"]: answer["selectedOptionId"] for answer in answers}
         if len(answer_map) != len(quiz["questions"]):
             raise HTTPException(status_code=400, detail="Please answer all questions before submitting")
@@ -1524,17 +1553,7 @@ class AppStore:
         self._attempts[attempt_id] = attempt
         self._attempt_answers[attempt_id] = details
 
-        stats = self.get_stats(user_id)
-        self.update_stats(user_id, {
-            "xp": stats["xp"] + earned_xp,
-            "coins": stats["coins"] + earned_coins,
-            "total_quizzes": stats.get("total_quizzes", 0) + 1,
-            "total_correct_answers": stats.get("total_correct_answers", 0) + correct,
-            "last_active_at": utc_now(),
-        })
-        self.increment_missions(user_id, "quiz_completed", 1)
-        self.unlock_achievements(user_id)
-        return self.format_attempt(attempt_id)
+        return self.apply_quiz_rewards_safely(user_id, attempt_id, earned_xp, earned_coins, correct)
 
     def generate_quiz(self, user_id: str, count: int = 10, difficulty: str = "beginner", question_types: list[str] | None = None) -> dict[str, Any]:
         if not self.use_postgres:
@@ -1542,6 +1561,11 @@ class AppStore:
             quiz["quizId"] = quiz["id"]
             quiz["difficulty"] = difficulty
             quiz["totalQuestions"] = len(quiz.get("questions", []))
+            self._generated_quiz_sessions[str(quiz["quizId"])] = {
+                "user_id": user_id,
+                "questions": deepcopy(quiz.get("questions", [])),
+            }
+            quiz["submissionToken"] = self.create_quiz_submission_token(user_id, str(quiz["quizId"]), deepcopy(quiz.get("questions", [])))
             return quiz
 
         allowed_types = {"meaning", "reverse", "pronunciation", "type", "fill_blank"}
@@ -1636,9 +1660,15 @@ class AppStore:
                     )
             connection.commit()
 
+        self._generated_quiz_sessions[session_id] = {
+            "user_id": user_id,
+            "questions": deepcopy(questions),
+        }
+
         return {
             "id": session_id,
             "quizId": session_id,
+            "submissionToken": self.create_quiz_submission_token(user_id, session_id, deepcopy(questions)),
             "title": "Vocabulary Quiz",
             "description": "Practice English vocabulary from dictionary",
             "difficulty": safe_difficulty,
@@ -1659,6 +1689,161 @@ class AppStore:
                 for question in questions
             ],
         }
+
+    def _score_generated_quiz_snapshot(self, quiz_id: str, session_snapshot: dict[str, Any], answers: list[dict[str, str]]) -> dict[str, Any]:
+        answer_map = {answer["questionId"]: answer["selectedOptionId"] for answer in answers}
+        questions = session_snapshot.get("questions", [])
+        if len(answer_map) != len(questions):
+            raise HTTPException(status_code=400, detail="Please answer all questions before submitting")
+
+        details: list[dict[str, Any]] = []
+        correct_count = 0
+        for question in questions:
+            question_id = str(question["id"])
+            selected_id = answer_map.get(question_id)
+            options = question.get("options", [])
+            selected = next((option for option in options if str(option["id"]) == str(selected_id)), None)
+            correct_option = next((option for option in options if option.get("isCorrect")), None)
+            if not selected or not correct_option:
+                raise HTTPException(status_code=400, detail=f"Invalid answer for question {question_id}")
+            is_correct = bool(selected.get("isCorrect"))
+            correct_count += 1 if is_correct else 0
+            details.append(
+                {
+                    "questionId": question_id,
+                    "questionText": question.get("questionText") or question.get("question") or "",
+                    "selectedOptionId": str(selected["id"]),
+                    "selectedOptionText": selected.get("text") or selected.get("optionText") or "",
+                    "selectedAnswer": selected.get("text") or selected.get("optionText") or "",
+                    "correctOptionId": str(correct_option["id"]),
+                    "correctOptionText": correct_option.get("text") or correct_option.get("optionText") or "",
+                    "correctAnswer": correct_option.get("text") or correct_option.get("optionText") or "",
+                    "isCorrect": is_correct,
+                    "explanation": question.get("explanation") or "",
+                }
+            )
+
+        total = len(questions)
+        percentage = round((correct_count / total) * 100) if total else 0
+        earned_xp = correct_count * 2 + (5 if percentage == 100 else 0)
+        earned_coins = correct_count // 2 + (2 if percentage == 100 else 0)
+        return {
+            "correct_count": correct_count,
+            "details": details,
+            "earned_coins": earned_coins,
+            "earned_xp": earned_xp,
+            "percentage": percentage,
+            "total": total,
+        }
+
+    def apply_quiz_rewards_safely(self, user_id: str, attempt_id: str, earned_xp: int, earned_coins: int, correct_count: int) -> dict[str, Any]:
+        try:
+            previous_stats = self.get_stats(user_id)
+            updated_stats = self.update_stats(
+                user_id,
+                {
+                    "xp": previous_stats["xp"] + earned_xp,
+                    "coins": previous_stats["coins"] + earned_coins,
+                    "total_quizzes": previous_stats.get("total_quizzes", 0) + 1,
+                    "total_correct_answers": previous_stats.get("total_correct_answers", 0) + correct_count,
+                    "last_active_at": utc_now(),
+                },
+            )
+            self.increment_missions(user_id, "quiz_completed", 1)
+            self.unlock_achievements(user_id)
+            return self.build_attempt_response(attempt_id, previous_stats, updated_stats)
+        except Exception as exc:
+            logger.warning(
+                "quiz_reward_update_failed",
+                extra={"attempt_id": attempt_id, "error": repr(exc), "user_id": user_id},
+            )
+            return self.format_attempt(attempt_id)
+
+    def create_quiz_submission_token(self, user_id: str, quiz_id: str, questions: list[dict[str, Any]]) -> str:
+        payload = {
+            "purpose": "quiz_submission",
+            "sub": str(user_id),
+            "quiz_id": str(quiz_id),
+            "questions": questions,
+            "exp": datetime.now(timezone.utc) + timedelta(hours=2),
+        }
+        return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_algorithm)
+
+    def read_quiz_submission_token(self, user_id: str, quiz_id: str, submission_token: str | None) -> dict[str, Any] | None:
+        if not submission_token:
+            return None
+        try:
+            payload = jwt.decode(submission_token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
+        except jwt.PyJWTError:
+            return None
+        if payload.get("purpose") != "quiz_submission":
+            return None
+        if str(payload.get("sub")) != str(user_id) or str(payload.get("quiz_id")) != str(quiz_id):
+            return None
+        questions = payload.get("questions")
+        if not isinstance(questions, list) or not questions:
+            return None
+        return {"user_id": user_id, "questions": questions}
+
+    def restore_quiz_session_from_snapshot(self, cursor: Any, user_id: str, quiz_id: str, session_snapshot: dict[str, Any]) -> None:
+        questions = session_snapshot.get("questions", [])
+        if not questions:
+            return
+
+        cursor.execute(
+            """
+            insert into quiz_sessions (id, user_id, title, difficulty, question_types, total_questions, created_at, expires_at)
+            values (%s::uuid, %s::uuid, %s, %s, %s, %s, now(), now() + interval '2 hours')
+            on conflict (id) do nothing
+            """,
+            (quiz_id, user_id, "Vocabulary Quiz", "mixed", [], len(questions)),
+        )
+
+        question_values = []
+        question_params: list[Any] = []
+        option_values = []
+        option_params: list[Any] = []
+        for index, question in enumerate(questions, start=1):
+            options = question.get("options", [])
+            correct_option = next((option for option in options if option.get("isCorrect")), None)
+            dictionary_word_id = question.get("dictionaryWordId")
+            if not dictionary_word_id or not correct_option:
+                return
+            question_values.append("(%s::uuid, %s::uuid, %s::uuid, %s, %s, %s, %s, %s, now())")
+            question_params.extend(
+                [
+                    question["id"],
+                    quiz_id,
+                    dictionary_word_id,
+                    question.get("type") or "meaning",
+                    question.get("questionText") or question.get("question") or "",
+                    correct_option.get("text") or correct_option.get("optionText") or "",
+                    question.get("explanation") or "",
+                    index,
+                ]
+            )
+            for option_index, option in enumerate(options, start=1):
+                option_values.append("(%s::uuid, %s::uuid, %s, %s, %s, now())")
+                option_params.extend([option["id"], question["id"], option.get("text") or option.get("optionText") or "", bool(option.get("isCorrect")), option_index])
+
+        if question_values:
+            cursor.execute(
+                f"""
+                insert into quiz_session_questions (id, session_id, dictionary_word_id, question_type, question_text, correct_answer_text, explanation, order_index, created_at)
+                values {", ".join(question_values)}
+                on conflict (id) do nothing
+                """,
+                tuple(question_params),
+            )
+        if option_values:
+            cursor.execute(
+                f"""
+                insert into quiz_session_options (id, session_question_id, option_text, is_correct, order_index, created_at)
+                values {", ".join(option_values)}
+                on conflict (id) do nothing
+                """,
+                tuple(option_params),
+            )
 
     def available_question_types(self, word: dict[str, Any], requested_types: list[str]) -> list[str]:
         available = []
@@ -1756,17 +1941,84 @@ class AppStore:
                     return choices
         return choices
 
-    def submit_generated_attempt(self, user_id: str, quiz_id: str, answers: list[dict[str, str]]) -> dict[str, Any]:
+    def submit_generated_attempt(self, user_id: str, quiz_id: str, answers: list[dict[str, str]], submission_token: str | None = None) -> dict[str, Any]:
+        return self.submit_quiz_session_attempt(user_id, quiz_id, answers, submission_token)
+
+    def submit_quiz_session_attempt(self, user_id: str, quiz_id: str, answers: list[dict[str, str]], submission_token: str | None = None) -> dict[str, Any]:
         answer_map = {answer["questionId"]: answer["selectedOptionId"] for answer in answers}
         details = []
         correct_count = 0
+
+        session_snapshot = self._generated_quiz_sessions.get(str(quiz_id))
+        if session_snapshot and str(session_snapshot.get("user_id")) == str(user_id):
+            scored = self._score_generated_quiz_snapshot(quiz_id, session_snapshot, answers)
+            details = scored["details"]
+            correct_count = scored["correct_count"]
+            total = scored["total"]
+            percentage = scored["percentage"]
+            earned_xp = scored["earned_xp"]
+            earned_coins = scored["earned_coins"]
+            attempt_id = str(uuid4())
+
+            if self.use_postgres:
+                postgres_db.execute(
+                    """
+                    insert into quiz_attempts (id, user_id, quiz_id, score, total_questions, correct_answers, earned_xp, earned_coins, percentage, created_at)
+                    values (%s::uuid, %s::uuid, %s, %s, %s, %s, %s, %s, %s, now())
+                    """,
+                    (attempt_id, user_id, quiz_id, correct_count, total, correct_count, earned_xp, earned_coins, percentage),
+                )
+                if details:
+                    values_sql = ", ".join(["(%s::uuid, %s, %s, %s, now())"] * len(details))
+                    params = tuple(
+                        value
+                        for detail in details
+                        for value in (attempt_id, detail["questionId"], detail["selectedOptionId"], detail["isCorrect"])
+                    )
+                    postgres_db.execute(
+                        f"""
+                        insert into quiz_attempt_answers (attempt_id, question_id, selected_option_id, is_correct, created_at)
+                        values {values_sql}
+                        """,
+                        params,
+                    )
+            else:
+                self._attempts[attempt_id] = {
+                    "id": attempt_id,
+                    "user_id": user_id,
+                    "quiz_id": quiz_id,
+                    "score": correct_count,
+                    "total_questions": total,
+                    "correct_answers": correct_count,
+                    "earned_xp": earned_xp,
+                    "earned_coins": earned_coins,
+                    "percentage": percentage,
+                    "created_at": utc_now(),
+                }
+                self._attempt_answers[attempt_id] = details
+
+            self._generated_quiz_sessions.pop(str(quiz_id), None)
+            return self.apply_quiz_rewards_safely(user_id, attempt_id, earned_xp, earned_coins, correct_count)
 
         with postgres_db.connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute("select * from quiz_sessions where id = %s::uuid and user_id = %s::uuid", (quiz_id, user_id))
                 session = cursor.fetchone()
                 if not session:
-                    raise HTTPException(status_code=404, detail="Quiz session not found")
+                    token_snapshot = self.read_quiz_submission_token(user_id, quiz_id, submission_token)
+                    if token_snapshot:
+                        self.restore_quiz_session_from_snapshot(cursor, user_id, quiz_id, token_snapshot)
+                        cursor.execute("select * from quiz_sessions where id = %s::uuid and user_id = %s::uuid", (quiz_id, user_id))
+                        session = cursor.fetchone()
+                if not session:
+                    raise HTTPException(
+                        status_code=status.HTTP_410_GONE,
+                        detail={
+                            "message": "Quiz session expired. Please generate a new quiz before submitting.",
+                            "code": "QUIZ_SESSION_EXPIRED",
+                            "quizId": quiz_id,
+                        },
+                    )
                 cursor.execute(
                     """
                     select
@@ -1853,54 +2105,9 @@ class AppStore:
                         """,
                         params,
                     )
-                cursor.execute(
-                    """
-                    update user_stats
-                    set xp = xp + %s,
-                        coins = coins + %s,
-                        total_quizzes = total_quizzes + 1,
-                        total_correct_answers = total_correct_answers + %s,
-                        last_active_at = now(),
-                        updated_at = now()
-                    where user_id = %s::uuid
-                    """,
-                    (earned_xp, earned_coins, correct_count, user_id),
-                )
-                cursor.execute(
-                    """
-                    update user_missions row
-                    set progress = least(mission.target_value, row.progress + 1),
-                        is_completed = least(mission.target_value, row.progress + 1) >= mission.target_value,
-                        completed_at = case
-                            when least(mission.target_value, row.progress + 1) >= mission.target_value and row.completed_at is null
-                            then now()
-                            else row.completed_at
-                        end,
-                        updated_at = now()
-                    from missions mission
-                    where row.mission_id = mission.id
-                      and row.user_id = %s::uuid
-                      and mission.target_type = %s
-                      and row.is_completed = false
-                    """,
-                    (user_id, "quiz_completed"),
-                )
             connection.commit()
 
-        self.update_stats(user_id, {"last_active_at": utc_now()})
-        return {
-            "id": attempt_id,
-            "attemptId": attempt_id,
-            "quizId": quiz_id,
-            "score": correct_count,
-            "totalQuestions": total,
-            "correctAnswers": correct_count,
-            "earnedXp": earned_xp,
-            "earnedCoins": earned_coins,
-            "percentage": percentage,
-            "answers": details,
-            "createdAt": utc_now(),
-        }
+        return self.apply_quiz_rewards_safely(user_id, attempt_id, earned_xp, earned_coins, correct_count)
 
     def format_attempt(self, attempt_id: str) -> dict[str, Any]:
         if self.use_postgres:
@@ -1971,6 +2178,25 @@ class AppStore:
             "answers": self._attempt_answers.get(attempt_id, []),
             "createdAt": attempt["created_at"],
         }
+
+    def build_level_up_payload(self, previous_stats: dict[str, Any], current_stats: dict[str, Any]) -> dict[str, Any] | None:
+        previous_ui_stats = self.format_stats_for_ui(previous_stats)
+        current_ui_stats = self.format_stats_for_ui(current_stats)
+        previous_level = int(previous_ui_stats.get("level", 0) or 0)
+        current_level = int(current_ui_stats.get("level", 0) or 0)
+        if current_level <= previous_level:
+            return None
+        return {
+            "level": current_level,
+            "nextLevelXp": current_ui_stats.get("nextLevelXp", 0),
+            "xp": current_ui_stats.get("xp", 0),
+        }
+
+    def build_attempt_response(self, attempt_id: str, previous_stats: dict[str, Any], current_stats: dict[str, Any]) -> dict[str, Any]:
+        attempt = self.format_attempt(attempt_id)
+        attempt["userStats"] = self.format_stats_for_ui(current_stats)
+        attempt["levelUp"] = self.build_level_up_payload(previous_stats, current_stats)
+        return attempt
 
     def increment_missions(self, user_id: str, target_type: str, amount: int) -> None:
         self.ensure_mission_rows(user_id)

@@ -9,16 +9,16 @@ def get_quiz(quiz_id: str) -> dict[str, object]:
     return store.get_quiz(quiz_id)
 
 
-def submit_attempt(user_id: str, quiz_id: str, answers: list[dict[str, str]]) -> dict[str, object]:
-    return store.submit_attempt(user_id, quiz_id, answers)
+def submit_attempt(user_id: str, quiz_id: str, answers: list[dict[str, str]], submission_token: str | None = None) -> dict[str, object]:
+    return store.submit_attempt(user_id, quiz_id, answers, submission_token)
 
 
 def generate_quiz(user_id: str, count: int, difficulty: str, question_types: list[str]) -> dict[str, object]:
     return store.generate_quiz(user_id, count=count, difficulty=difficulty, question_types=question_types)
 
 
-def submit_generated_attempt(user_id: str, quiz_id: str, answers: list[dict[str, str]]) -> dict[str, object]:
-    return store.submit_generated_attempt(user_id, quiz_id, answers)
+def submit_generated_attempt(user_id: str, quiz_id: str, answers: list[dict[str, str]], submission_token: str | None = None) -> dict[str, object]:
+    return store.submit_generated_attempt(user_id, quiz_id, answers, submission_token)
 
 
 def get_attempt(attempt_id: str) -> dict[str, object]:
