@@ -74,6 +74,20 @@ def parse_iso_datetime(value: Any) -> datetime | None:
     return None
 
 
+def weekday_label(value: date) -> str:
+    labels = ["T2", "T3", "T4", "T5", "T6", "T7", "CN"]
+    return labels[value.weekday()]
+
+
+def format_topic_label(value: str | None) -> str:
+    if not value:
+        return "Chung"
+    normalized = re.sub(r"[_\-]+", " ", str(value)).strip()
+    if not normalized:
+        return "Chung"
+    return " ".join(part[:1].upper() + part[1:] for part in normalized.split())
+
+
 def resolve_level_progress(total_xp: int) -> dict[str, int]:
     safe_total_xp = max(0, int(total_xp))
     level = 0
@@ -2042,12 +2056,153 @@ class AppStore:
 
     def progress_summary(self, user_id: str) -> dict[str, Any]:
         stats = self.get_stats(user_id)
-        return self.progress_summary_from_stats(stats)
+        return self.progress_summary_from_stats(stats, user_id)
 
-    def progress_summary_from_stats(self, stats: dict[str, Any]) -> dict[str, Any]:
+    def build_weekly_xp_activity(self, user_id: str) -> tuple[list[int], list[str]]:
+        today = date.today()
+        days = [today - timedelta(days=offset) for offset in range(6, -1, -1)]
+        day_index = {day.isoformat(): index for index, day in enumerate(days)}
+        xp7days = [0] * len(days)
+
+        if self.use_postgres:
+            rows = postgres_db.fetch_all(
+                """
+                select earned_xp, created_at
+                from quiz_attempts
+                where user_id = %s::uuid
+                  and created_at >= %s
+                order by created_at asc
+                """,
+                (user_id, datetime.combine(days[0], datetime.min.time(), tzinfo=timezone.utc)),
+            )
+            attempts = [dict(row) for row in rows]
+        else:
+            attempts = [
+                attempt
+                for attempt in self._attempts.values()
+                if str(attempt.get("user_id")) == str(user_id)
+            ]
+
+        for attempt in attempts:
+            created_at = parse_iso_datetime(attempt.get("created_at"))
+            if not created_at:
+                continue
+            day_key = created_at.date().isoformat()
+            if day_key not in day_index:
+                continue
+            xp7days[day_index[day_key]] += max(0, int(attempt.get("earned_xp", 0) or 0))
+
+        return xp7days, [weekday_label(day) for day in days]
+
+    def build_topic_progress(self, user_id: str) -> list[dict[str, Any]]:
+        if self.use_postgres:
+            rows = postgres_db.fetch_all(
+                """
+                select
+                  coalesce(nullif(dw.type, ''), nullif(q.question_type, ''), 'general') as raw_topic,
+                  count(*) as total_answers,
+                  sum(case when a.is_correct then 1 else 0 end) as correct_answers
+                from quiz_attempt_answers a
+                join quiz_attempts attempt on attempt.id = a.attempt_id::uuid
+                join quiz_session_questions q on q.id = a.question_id::uuid
+                left join dictionary_words dw on dw.id = q.dictionary_word_id
+                where attempt.user_id = %s::uuid
+                group by raw_topic
+                order by total_answers desc, raw_topic asc
+                """,
+                (user_id,),
+            )
+            topic_rows = [dict(row) for row in rows]
+        else:
+            question_topic_map: dict[str, str] = {}
+            for quiz in QUIZZES:
+                for question in quiz.get("questions", []):
+                    question_topic_map[str(question.get("id"))] = str(quiz.get("topic") or "general")
+
+            totals: dict[str, dict[str, int]] = {}
+            for attempt_id, answers in self._attempt_answers.items():
+                attempt = self._attempts.get(attempt_id)
+                if not attempt or str(attempt.get("user_id")) != str(user_id):
+                    continue
+                for answer in answers:
+                    raw_topic = question_topic_map.get(str(answer.get("questionId")), "general")
+                    bucket = totals.setdefault(raw_topic, {"correct_answers": 0, "total_answers": 0})
+                    bucket["total_answers"] += 1
+                    bucket["correct_answers"] += 1 if answer.get("isCorrect") else 0
+
+            topic_rows = [
+                {"raw_topic": topic, **values}
+                for topic, values in sorted(totals.items(), key=lambda item: (-item[1]["total_answers"], item[0]))
+            ]
+
+        topic_progress: list[dict[str, Any]] = []
+        for row in topic_rows:
+            total_answers = int(row.get("total_answers", 0) or 0)
+            if total_answers <= 0:
+                continue
+            correct_answers = int(row.get("correct_answers", 0) or 0)
+            topic_progress.append(
+                {
+                    "topic": format_topic_label(str(row.get("raw_topic") or "general")),
+                    "score": round((correct_answers / total_answers) * 100),
+                    "correctAnswers": correct_answers,
+                    "totalAnswers": total_answers,
+                }
+            )
+
+        return topic_progress
+
+    def build_ai_roadmap(
+        self,
+        stats: dict[str, Any],
+        xp7days: list[int],
+        topic_progress: list[dict[str, Any]],
+        weak_topics: list[str],
+    ) -> list[str]:
+        accuracy = round((stats.get("total_correct_answers", 0) / max(1, stats.get("total_quizzes", 0) * 3)) * 100)
+        total_study_minutes = int(stats.get("total_study_minutes", 0) or 0)
+        current_streak = int(stats.get("streak", 0) or 0)
+        roadmap: list[str] = []
+
+        if stats.get("total_quizzes", 0) <= 0:
+            roadmap.append("Làm 1 quiz đầu tiên để hệ thống bắt đầu phân tích tiến độ học của bạn.")
+        if weak_topics:
+            roadmap.append(f"Ôn lại chủ đề {weak_topics[0]} trước khi làm thêm quiz mới để tăng độ chính xác.")
+        if accuracy < 70:
+            roadmap.append("Chọn một quiz ngắn và tập trung làm chậm, chắc để cải thiện độ chính xác tổng thể.")
+        if sum(xp7days) <= 0:
+            roadmap.append("Hôm nay nên hoàn thành ít nhất 1 quiz để biểu đồ XP 7 ngày bắt đầu ghi nhận tiến độ thật.")
+        if total_study_minutes < 90:
+            roadmap.append("Tăng thêm 15-20 phút học trong ngày để xây nền đều hơn cho tuần này.")
+        if current_streak > 0:
+            roadmap.append(f"Giữ streak thêm 1 ngày nữa để không làm gián đoạn nhịp học hiện tại của bạn.")
+        else:
+            roadmap.append("Bắt đầu streak mới bằng một phiên học ngắn hôm nay, chỉ cần 10-15 phút cũng đủ.")
+        if topic_progress:
+            strongest_topic = max(topic_progress, key=lambda item: item["score"])
+            roadmap.append(f"Tiếp tục phát huy ở {strongest_topic['topic']} vì đây đang là mảng bạn làm tốt nhất.")
+
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for item in roadmap:
+            if item in seen:
+                continue
+            seen.add(item)
+            deduped.append(item)
+            if len(deduped) >= 3:
+                break
+
+        return deduped
+
+    def progress_summary_from_stats(self, stats: dict[str, Any], user_id: str | None = None) -> dict[str, Any]:
         stats = self.normalize_stats_row(stats)
         total_quizzes = stats.get("total_quizzes", 0)
         total_questions = max(1, total_quizzes * 3)
+        xp7days, xp7day_labels = self.build_weekly_xp_activity(user_id) if user_id else ([0] * 7, ["T2", "T3", "T4", "T5", "T6", "T7", "CN"])
+        topic_progress = self.build_topic_progress(user_id) if user_id else []
+        strong_topics = [item["topic"] for item in sorted(topic_progress, key=lambda topic: (-topic["score"], -topic["totalAnswers"], topic["topic"]))[:3]]
+        weak_topics = [item["topic"] for item in sorted(topic_progress, key=lambda topic: (topic["score"], -topic["totalAnswers"], topic["topic"]))[:3]]
+        ai_roadmap = self.build_ai_roadmap(stats, xp7days, topic_progress, weak_topics)
         return {
             "level": stats["level"],
             "xp": resolve_level_progress(stats["xp"])["xp_into_level"],
@@ -2057,20 +2212,13 @@ class AppStore:
             "quizCompleted": total_quizzes,
             "accuracy": round((stats.get("total_correct_answers", 0) / total_questions) * 100),
             "studyTime": f"{stats.get('total_study_minutes', 0) // 60}h {stats.get('total_study_minutes', 0) % 60}m",
-            "weeklyActivity": [120, 180, 220, 160, 240, 280, 200],
-            "xp7Days": [120, 180, 220, 160, 240, 280, 200],
-            "topicProgress": [
-                {"topic": "Vocabulary", "score": 88},
-                {"topic": "Reading", "score": 82},
-                {"topic": "Present Perfect", "score": 64},
-            ],
-            "strongTopics": ["Vocabulary", "Reading", "Basic Grammar"],
-            "weakTopics": ["Present Perfect", "Phrasal Verbs", "Academic Writing"],
-            "aiRoadmap": [
-                "Ôn Present Perfect trong 15 phút.",
-                "Làm 1 quiz Grammar mức trung bình.",
-                "Ôn lại 8 câu sai gần nhất bằng flashcard.",
-            ],
+            "weeklyActivity": xp7days,
+            "xp7Days": xp7days,
+            "xp7DayLabels": xp7day_labels,
+            "topicProgress": topic_progress,
+            "strongTopics": strong_topics,
+            "weakTopics": weak_topics,
+            "aiRoadmap": ai_roadmap,
         }
 
     def dashboard(self, user_id: str) -> dict[str, Any]:
@@ -2137,7 +2285,7 @@ class AppStore:
                 "last_active_at": row.get("last_active_at"),
                 "updated_at": row.get("stats_updated_at"),
             }
-            progress_summary = self.progress_summary_from_stats(stats)
+            progress_summary = self.progress_summary_from_stats(stats, user_id)
             mission_rows = [
                 dict(item)
                 for item in postgres_db.fetch_all("select * from user_missions where user_id = %s::uuid", (user_id,))
@@ -2182,7 +2330,7 @@ class AppStore:
 
         user = public_user(self.get_user(user_id))
         stats = self.get_stats(user_id)
-        progress_summary = self.progress_summary_from_stats(stats)
+        progress_summary = self.progress_summary_from_stats(stats, user_id)
         return {
             "user": {**user, **self.format_stats_for_ui(stats, progress_summary)},
             "statsCards": [
