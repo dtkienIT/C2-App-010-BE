@@ -21,9 +21,12 @@ from backend.database.store import parse_datetime
 from backend.database.store import public_user, store
 
 
-def issue_token(user: dict[str, Any]) -> dict[str, object]:
+def issue_token(user: dict[str, Any], daily_check_in: dict[str, Any] | None = None) -> dict[str, object]:
     token = create_access_token(str(user["id"]), {"email": user["email"], "role": user.get("role", "student")})
-    return {"access_token": token, "token_type": "bearer", "user": public_user(user)}
+    response: dict[str, object] = {"access_token": token, "token_type": "bearer", "user": public_user(user)}
+    if daily_check_in is not None:
+        response["dailyCheckIn"] = daily_check_in
+    return response
 
 
 def is_verified(user: dict[str, Any]) -> bool:
@@ -92,8 +95,8 @@ def login(email: str, password: str) -> dict[str, object]:
             details["verification_session_id"] = str(latest["verification_session_id"])
             details["email"] = user["email"]
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=details)
-    store.update_stats(str(user["id"]), {"last_active_at": now_utc().isoformat()})
-    return issue_token(user)
+    daily_check_in = store.get_stats_with_daily_check_in(str(user["id"]))["dailyCheckIn"]
+    return issue_token(user, daily_check_in)
 
 
 def verify_email(verification_session_id: str, otp: str) -> dict[str, object]:
@@ -122,7 +125,8 @@ def verify_email(verification_session_id: str, otp: str) -> dict[str, object]:
 
     store.update_email_verification_otp(verification_session_id, {"used_at": now_utc()})
     verified_user = store.mark_email_verified(str(user["id"]))
-    return issue_token(verified_user)
+    daily_check_in = store.get_stats_with_daily_check_in(str(user["id"]))["dailyCheckIn"]
+    return issue_token(verified_user, daily_check_in)
 
 
 def resend_verification_otp(verification_session_id: str, request: Request | None = None) -> dict[str, object]:
@@ -136,4 +140,5 @@ def resend_verification_otp(verification_session_id: str, request: Request | Non
 
 
 def me(user_id: str) -> dict[str, object]:
-    return public_user(store.get_user(user_id))
+    daily_result = store.get_stats_with_daily_check_in(user_id)
+    return {**public_user(store.get_user(user_id)), "dailyCheckIn": daily_result["dailyCheckIn"]}

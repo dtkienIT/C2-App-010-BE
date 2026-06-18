@@ -23,9 +23,15 @@ from backend.database.seed_data import (
     ROOM_BACKGROUNDS,
 )
 
+STREAK_DAILY_COIN_REWARD = 15
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def current_utc_date() -> date:
+    return datetime.now(timezone.utc).date()
 
 
 def today_scope() -> str:
@@ -72,6 +78,27 @@ def parse_iso_datetime(value: Any) -> datetime | None:
         except ValueError:
             return None
     return None
+
+
+def parse_iso_date(value: Any) -> date | None:
+    if not value:
+        return None
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return value
+    parsed_datetime = parse_iso_datetime(value)
+    if parsed_datetime:
+        return parsed_datetime.date()
+    if isinstance(value, str):
+        try:
+            return date.fromisoformat(value)
+        except ValueError:
+            return None
+    return None
+
+
+def iso_date_string(value: Any) -> str | None:
+    parsed = parse_iso_date(value)
+    return parsed.isoformat() if parsed else None
 
 
 def weekday_label(value: date) -> str:
@@ -194,6 +221,7 @@ class AppStore:
         self._buddies_cache: list[dict[str, Any]] | None = None
         self._email_verification_otps: list[dict[str, Any]] = []
         self._postgres_table_exists_cache: dict[str, bool] = {}
+        self._postgres_column_exists_cache: dict[tuple[str, str], bool] = {}
 
     @property
     def use_postgres(self) -> bool:
@@ -221,6 +249,29 @@ class AppStore:
         )
         exists = bool(row["exists"]) if row else False
         self._postgres_table_exists_cache[table_name] = exists
+        return exists
+
+    def postgres_column_exists(self, table_name: str, column_name: str) -> bool:
+        if not self.use_postgres:
+            return False
+        cache_key = (table_name, column_name)
+        if cache_key in self._postgres_column_exists_cache:
+            return self._postgres_column_exists_cache[cache_key]
+
+        row = postgres_db.fetch_one(
+            """
+            select exists (
+              select 1
+              from information_schema.columns
+              where table_schema = 'public'
+                and table_name = %s
+                and column_name = %s
+            ) as exists
+            """,
+            (table_name, column_name),
+        )
+        exists = bool(row["exists"]) if row else False
+        self._postgres_column_exists_cache[cache_key] = exists
         return exists
 
     def _table(self, table: str):
@@ -520,24 +571,175 @@ class AppStore:
         return self._users[user_id]
 
     def get_stats(self, user_id: str) -> dict[str, Any]:
+        return self.get_stats_with_daily_check_in(user_id)["stats"]
+
+    def get_stats_with_daily_check_in(self, user_id: str, reference_at: Any | None = None) -> dict[str, Any]:
+        daily_result = self.apply_daily_check_in(user_id, reference_at=reference_at)
+        return {
+            "dailyCheckIn": daily_result["dailyCheckIn"],
+            "stats": self.normalize_stats_row(daily_result["stats"]),
+        }
+
+    def apply_daily_check_in(self, user_id: str, reference_at: Any | None = None) -> dict[str, Any]:
+        reference_dt = parse_iso_datetime(reference_at) or datetime.now(timezone.utc)
         if self.use_postgres:
-            row = postgres_db.fetch_one("select * from user_stats where user_id = %s::uuid", (user_id,))
-            if not row:
-                self.ensure_user_defaults(user_id)
-                row = postgres_db.fetch_one("select * from user_stats where user_id = %s::uuid", (user_id,))
-            if not row:
-                raise HTTPException(status_code=404, detail="User stats not found")
-            return self.sync_streak_for_reference(user_id, self.normalize_stats_row(dict(row)))
+            has_daily_columns = self.postgres_column_exists("user_stats", "streak_count")
+            with postgres_db.connect() as connection:
+                with connection.cursor() as cursor:
+                    self._ensure_user_defaults_postgres(user_id, cursor)
+                    cursor.execute("select * from user_stats where user_id = %s::uuid for update", (user_id,))
+                    row = cursor.fetchone()
+                    if not row:
+                        raise HTTPException(status_code=404, detail="User stats not found")
+                    current = self.normalize_stats_row(dict(row))
+                    if not has_daily_columns:
+                        result = self._resolve_legacy_daily_check_in(current, reference_dt)
+                        cursor.execute(
+                            """
+                            update user_stats
+                            set coins = %s,
+                                streak = %s,
+                                last_active_at = %s,
+                                updated_at = now()
+                            where user_id = %s::uuid
+                            """,
+                            (
+                                result["stats"]["coins"],
+                                result["stats"]["streak"],
+                                result["stats"].get("last_active_at"),
+                                user_id,
+                            ),
+                        )
+                        connection.commit()
+                        return result
+                    result = self._resolve_daily_check_in(current, reference_dt)
+                    next_stats = self.normalize_stats_row(result["stats"])
+                    cursor.execute(
+                        """
+                        update user_stats
+                        set coins = %s,
+                            streak = %s,
+                            streak_count = %s,
+                            last_streak_date = %s,
+                            last_login_reward_date = %s,
+                            last_active_at = %s,
+                            updated_at = now()
+                        where user_id = %s::uuid
+                        """,
+                        (
+                            next_stats["coins"],
+                            next_stats["streak"],
+                            next_stats["streak_count"],
+                            next_stats.get("last_streak_date"),
+                            next_stats.get("last_login_reward_date"),
+                            next_stats.get("last_active_at"),
+                            user_id,
+                        ),
+                    )
+                connection.commit()
+            return result
         if self.use_supabase:
+            self.ensure_user_defaults(user_id)
             rows = self._table("user_stats").select("*").eq("user_id", user_id).execute().data
-            return self.sync_streak_for_reference(user_id, self.normalize_stats_row(rows[0]))
-        return self.sync_streak_for_reference(user_id, self.normalize_stats_row(self._stats[user_id]))
+            current = self.normalize_stats_row(rows[0]) if rows else self.normalize_stats_row({"user_id": user_id, **deepcopy(NEW_USER_STATS), "last_active_at": utc_now()})
+            result = self._resolve_daily_check_in(current, reference_dt)
+            self._table("user_stats").update(result["stats"]).eq("user_id", user_id).execute()
+            return result
+        self.ensure_user_defaults(user_id)
+        current = self.normalize_stats_row(self._stats[user_id])
+        result = self._resolve_daily_check_in(current, reference_dt)
+        self._stats[user_id] = result["stats"]
+        return result
+
+    def _resolve_daily_check_in(self, stats: dict[str, Any], reference_dt: datetime) -> dict[str, Any]:
+        normalized_stats = self.normalize_stats_row(stats)
+        today = reference_dt.date()
+        today_iso = today.isoformat()
+        last_streak_date = parse_iso_date(normalized_stats.get("last_streak_date"))
+        last_reward_date = parse_iso_date(normalized_stats.get("last_login_reward_date"))
+        current_streak = max(0, int(normalized_stats.get("streak_count", normalized_stats.get("streak", 0)) or 0))
+        already_checked_in_today = last_streak_date == today
+        awarded = False
+        reward = 0
+        next_streak = current_streak
+
+        if already_checked_in_today:
+            next_streak = current_streak if current_streak > 0 else 1
+        else:
+            if last_streak_date == today - timedelta(days=1):
+                next_streak = max(1, current_streak) + 1
+            else:
+                next_streak = 1
+            if last_reward_date != today:
+                awarded = True
+                reward = STREAK_DAILY_COIN_REWARD
+
+        next_stats = self.normalize_stats_row(
+            {
+                **normalized_stats,
+                "coins": int(normalized_stats.get("coins", 0) or 0) + reward,
+                "streak": next_streak,
+                "streak_count": next_streak,
+                "last_streak_date": today_iso if not already_checked_in_today else iso_date_string(normalized_stats.get("last_streak_date")) or today_iso,
+                "last_login_reward_date": today_iso if awarded else iso_date_string(normalized_stats.get("last_login_reward_date")),
+                "last_active_at": reference_dt.isoformat(),
+            },
+        )
+
+        return {
+            "dailyCheckIn": {
+                "alreadyCheckedInToday": already_checked_in_today,
+                "awarded": awarded,
+                "checkedInDate": today_iso,
+                "reward": reward,
+                "streakCount": next_streak,
+            },
+            "stats": next_stats,
+        }
+
+    def _resolve_legacy_daily_check_in(self, stats: dict[str, Any], reference_dt: datetime) -> dict[str, Any]:
+        normalized_stats = self.normalize_stats_row(stats)
+        today = reference_dt.date()
+        previous_active_at = parse_iso_datetime(normalized_stats.get("last_active_at"))
+        previous_day = previous_active_at.date() if previous_active_at else None
+        already_checked_in_today = previous_day == today
+        current_streak = max(0, int(normalized_stats.get("streak", 0) or 0))
+        reward = 0
+        awarded = False
+
+        if already_checked_in_today:
+          next_streak = current_streak if current_streak > 0 else 1
+        elif previous_day == today - timedelta(days=1):
+          next_streak = max(1, current_streak) + 1
+          reward = STREAK_DAILY_COIN_REWARD
+          awarded = True
+        else:
+          next_streak = 1
+          reward = STREAK_DAILY_COIN_REWARD
+          awarded = True
+
+        next_stats = self.normalize_stats_row(
+            {
+                **normalized_stats,
+                "coins": int(normalized_stats.get("coins", 0) or 0) + reward,
+                "streak": next_streak,
+                "last_active_at": reference_dt.isoformat(),
+            },
+        )
+        return {
+            "dailyCheckIn": {
+                "alreadyCheckedInToday": already_checked_in_today,
+                "awarded": awarded,
+                "checkedInDate": today.isoformat(),
+                "reward": reward,
+                "streakCount": next_streak,
+            },
+            "stats": next_stats,
+        }
 
     def update_stats(self, user_id: str, patch: dict[str, Any]) -> dict[str, Any]:
         current = self.get_stats(user_id)
         next_row = self.normalize_stats_row({**current, **patch, "updated_at": utc_now()})
-        if "last_active_at" in patch and patch.get("last_active_at"):
-            next_row["streak"] = calculate_streak(current.get("streak", 0), current.get("last_active_at"), patch.get("last_active_at"))
         if self.use_postgres:
             allowed = {
                 "level",
@@ -549,6 +751,8 @@ class AppStore:
                 "total_study_minutes",
                 "last_active_at",
             }
+            if self.postgres_column_exists("user_stats", "streak_count"):
+                allowed.update({"streak_count", "last_streak_date", "last_login_reward_date"})
             assignments = [f"{key} = %s" for key in next_row if key in allowed]
             params = [next_row[key] for key in next_row if key in allowed]
             if assignments:
@@ -567,7 +771,11 @@ class AppStore:
         next_row = dict(row)
         next_row["xp"] = max(0, int(next_row.get("xp", 0) or 0))
         next_row["coins"] = max(0, int(next_row.get("coins", 0) or 0))
-        next_row["streak"] = max(0, int(next_row.get("streak", 0) or 0))
+        streak_count = max(0, int(next_row.get("streak_count", next_row.get("streak", 0)) or 0))
+        next_row["streak_count"] = streak_count
+        next_row["streak"] = streak_count
+        next_row["last_streak_date"] = iso_date_string(next_row.get("last_streak_date"))
+        next_row["last_login_reward_date"] = iso_date_string(next_row.get("last_login_reward_date"))
         progress = resolve_level_progress(next_row["xp"])
         next_row["level"] = progress["level"]
         return next_row
