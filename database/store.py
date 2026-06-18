@@ -577,6 +577,7 @@ class AppStore:
 
     def get_stats(self, user_id: str) -> dict[str, Any]:
         if self.use_postgres:
+
             with postgres_db.connect() as connection:
                 with connection.cursor() as cursor:
                     self._ensure_user_defaults_postgres(user_id, cursor)
@@ -585,6 +586,7 @@ class AppStore:
                     if not row:
                         raise HTTPException(status_code=404, detail="User stats not found")
                 connection.commit()
+
             return self.normalize_stats_row(dict(row))
         if self.use_supabase:
             self.ensure_user_defaults(user_id)
