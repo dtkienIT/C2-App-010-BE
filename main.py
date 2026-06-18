@@ -15,7 +15,7 @@ from backend.missions.router import router as missions_router
 from backend.newsfeed.router import router as newsfeed_router
 from backend.notifications.router import router as notifications_router
 from backend.notifications.service import notification_test_endpoint_enabled
-from backend.notifications.worker import run_forever as run_notification_worker
+from backend.notifications.worker import get_worker_status, run_forever as run_notification_worker
 from backend.progress.router import router as progress_router
 from backend.quizzes.router import router as quizzes_router
 from backend.rewards.router import router as rewards_router
@@ -80,6 +80,7 @@ def create_app() -> FastAPI:
 
     @app.get("/health")
     def health() -> dict[str, object]:
+        worker_status = get_worker_status()
         return {
             "success": True,
             "data": {
@@ -88,6 +89,8 @@ def create_app() -> FastAPI:
                 "webPushConfigured": bool(settings.web_push_vapid_public_key and settings.web_push_vapid_private_key),
                 "notificationTestEndpointEnabled": notification_test_endpoint_enabled(),
                 "embeddedNotificationWorkerEnabled": settings.notification_worker_embedded_enabled,
+                "embeddedNotificationWorkerAlive": bool(worker_status.get("is_running")),
+                "notificationWorker": worker_status,
             },
         }
 

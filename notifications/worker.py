@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 import logging
 import os
-from threading import Event
+from threading import Event, Lock
 import time
 from typing import Any
 
@@ -20,10 +20,38 @@ from backend.notifications.scheduler import enqueue_due_reminders
 from backend.notifications.web_push_client import WebPushClient, client
 
 logger = logging.getLogger(__name__)
+_worker_status_lock = Lock()
+_worker_status: dict[str, Any] = {
+    "worker_id": None,
+    "started_at": None,
+    "last_poll_at": None,
+    "last_success_at": None,
+    "last_error_at": None,
+    "last_error_type": None,
+    "last_counts": None,
+    "is_running": False,
+}
 
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _iso(value: datetime | None) -> str | None:
+    return value.astimezone(timezone.utc).isoformat() if value else None
+
+
+def update_worker_status(**patch: Any) -> None:
+    with _worker_status_lock:
+        _worker_status.update(patch)
+
+
+def get_worker_status() -> dict[str, Any]:
+    with _worker_status_lock:
+        snapshot = dict(_worker_status)
+    for key in ("started_at", "last_poll_at", "last_success_at", "last_error_at"):
+        snapshot[key] = _iso(snapshot.get(key))
+    return snapshot
 
 
 def parse_datetime(value: Any) -> datetime:
@@ -239,16 +267,35 @@ def run_once(
 
 def run_forever(*, worker_id: str | None = None, stop_event: Event | None = None) -> None:
     worker_id = worker_id or f"notification-worker:{os.getpid()}"
+    update_worker_status(
+        worker_id=worker_id,
+        started_at=utc_now(),
+        last_poll_at=None,
+        last_success_at=None,
+        last_error_at=None,
+        last_error_type=None,
+        last_counts=None,
+        is_running=True,
+    )
     logger.info("notification_worker_started", extra={"worker_id": worker_id})
-    while stop_event is None or not stop_event.is_set():
-        counts = run_once(worker_id=worker_id)
-        if counts["scheduled"] or counts["claimed"]:
-            logger.info("notification_worker_batch", extra=counts)
-        sleep_seconds = max(1, settings.notification_worker_poll_seconds)
-        if stop_event is None:
-            time.sleep(sleep_seconds)
-        else:
-            stop_event.wait(sleep_seconds)
+    try:
+        while stop_event is None or not stop_event.is_set():
+            update_worker_status(last_poll_at=utc_now())
+            try:
+                counts = run_once(worker_id=worker_id)
+                update_worker_status(last_success_at=utc_now(), last_error_type=None, last_counts=counts)
+                if counts["scheduled"] or counts["claimed"]:
+                    logger.info("notification_worker_batch", extra=counts)
+            except Exception as exc:  # pragma: no cover - keeps embedded worker alive after transient DB/network errors.
+                update_worker_status(last_error_at=utc_now(), last_error_type=type(exc).__name__)
+                logger.exception("notification_worker_poll_failed", extra={"worker_id": worker_id, "error_type": type(exc).__name__})
+            sleep_seconds = max(1, settings.notification_worker_poll_seconds)
+            if stop_event is None:
+                time.sleep(sleep_seconds)
+            else:
+                stop_event.wait(sleep_seconds)
+    finally:
+        update_worker_status(is_running=False)
 
 
 def main() -> None:
