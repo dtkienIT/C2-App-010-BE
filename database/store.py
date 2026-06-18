@@ -571,7 +571,20 @@ class AppStore:
         return self._users[user_id]
 
     def get_stats(self, user_id: str) -> dict[str, Any]:
-        return self.get_stats_with_daily_check_in(user_id)["stats"]
+        if self.use_postgres:
+            self._ensure_user_defaults_postgres(user_id)
+            row = postgres_db.fetch_one("select * from user_stats where user_id = %s::uuid", (user_id,))
+            if not row:
+                raise HTTPException(status_code=404, detail="User stats not found")
+            return self.normalize_stats_row(dict(row))
+        if self.use_supabase:
+            self.ensure_user_defaults(user_id)
+            rows = self._table("user_stats").select("*").eq("user_id", user_id).execute().data
+            if not rows:
+                raise HTTPException(status_code=404, detail="User stats not found")
+            return self.normalize_stats_row(rows[0])
+        self.ensure_user_defaults(user_id)
+        return self.normalize_stats_row(self._stats[user_id])
 
     def get_stats_with_daily_check_in(self, user_id: str, reference_at: Any | None = None) -> dict[str, Any]:
         daily_result = self.apply_daily_check_in(user_id, reference_at=reference_at)
