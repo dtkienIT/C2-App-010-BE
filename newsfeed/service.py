@@ -42,21 +42,21 @@ FEED_SOURCES: tuple[FeedSource, ...] = (
         name='BBC News',
         topic_tag='Reading',
         url='https://feeds.bbci.co.uk/news/world/rss.xml',
-        cta_label='Doc tom tat',
+        cta_label='Đọc tóm tắt',
         learning_action='open_summary',
     ),
     FeedSource(
         name='NPR Technology',
         topic_tag='Vocabulary',
         url='https://feeds.npr.org/1019/rss.xml',
-        cta_label='Luu tu vung',
+        cta_label='Lưu từ vựng',
         learning_action='save_vocab',
     ),
     FeedSource(
         name='BBC News Business',
         topic_tag='Focus',
         url='https://feeds.bbci.co.uk/news/business/rss.xml',
-        cta_label='Lam quiz nhanh',
+        cta_label='Làm quiz nhanh',
         learning_action='start_quiz',
     ),
 )
@@ -159,6 +159,39 @@ def _strip_html(value: str | None) -> str:
     return text
 
 
+def _repair_mojibake(value: str | None) -> str:
+    if not value:
+        return ''
+
+    try:
+        repaired = value.encode('latin1').decode('utf-8')
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return value
+
+    return repaired if repaired != value else value
+
+
+def _sanitize_newsfeed_text(value: str | None) -> str:
+    return _repair_mojibake(value).strip()
+
+
+def _sanitize_newsfeed_item(item: NewsfeedItem) -> NewsfeedItem:
+    return NewsfeedItem(
+        id=item.id,
+        title=_sanitize_newsfeed_text(item.title),
+        summary=_sanitize_newsfeed_text(item.summary),
+        source=_sanitize_newsfeed_text(item.source),
+        publishedAt=_sanitize_newsfeed_text(item.publishedAt),
+        url=item.url,
+        imageUrl=item.imageUrl,
+        imageAlt=_sanitize_newsfeed_text(item.imageAlt),
+        topicTag=_sanitize_newsfeed_text(item.topicTag),
+        ctaLabel=_sanitize_newsfeed_text(item.ctaLabel),
+        isNew=item.isNew,
+        learningAction=item.learningAction,
+    )
+
+
 def _truncate_summary(summary: str, limit: int = 170) -> str:
     cleaned = summary.strip()
     if len(cleaned) <= limit:
@@ -169,7 +202,7 @@ def _truncate_summary(summary: str, limit: int = 170) -> str:
 
 def _format_published_at(raw_value: str | None) -> str:
     if not raw_value:
-        return 'Moi cap nhat'
+        return 'Mới cập nhật'
     try:
         published = parsedate_to_datetime(raw_value)
         if published.tzinfo is None:
@@ -178,14 +211,14 @@ def _format_published_at(raw_value: str | None) -> str:
         delta = max(now - published.astimezone(UTC), timedelta())
         if delta < timedelta(minutes=60):
             minutes = max(1, int(delta.total_seconds() // 60))
-            return f'{minutes} phut truoc'
+            return f'{minutes} phút trước'
         if delta < timedelta(hours=24):
             hours = max(1, int(delta.total_seconds() // 3600))
-            return f'{hours} gio truoc'
+            return f'{hours} giờ trước'
         days = max(1, delta.days)
-        return f'{days} ngay truoc'
+        return f'{days} ngày trước'
     except (TypeError, ValueError, OverflowError):
-        return 'Moi cap nhat'
+        return 'Mới cập nhật'
 
 
 def _find_image_url(item: DET.Element, link: str | None) -> str | None:
@@ -221,9 +254,9 @@ def _parse_feed(source: FeedSource, xml_text: str) -> list[NewsfeedItem]:
     parsed_items: list[NewsfeedItem] = []
 
     for entry in items[:6]:
-        title = (entry.findtext('title') or '').strip()
+        title = _sanitize_newsfeed_text(entry.findtext('title'))
         link = (entry.findtext('link') or '').strip() or None
-        description = _strip_html(entry.findtext('description'))
+        description = _sanitize_newsfeed_text(_strip_html(entry.findtext('description')))
         summary = _truncate_summary(description or title)
         image_url = _find_image_url(entry, link)
         image_alt = f'{title} - {source.name}' if title else source.name
@@ -235,7 +268,7 @@ def _parse_feed(source: FeedSource, xml_text: str) -> list[NewsfeedItem]:
                 title=title,
                 summary=summary,
                 source=source.name,
-                publishedAt=_format_published_at(entry.findtext('pubDate')),
+                publishedAt=_sanitize_newsfeed_text(_format_published_at(entry.findtext('pubDate'))),
                 url=link,
                 imageUrl=image_url,
                 imageAlt=image_alt,
@@ -301,7 +334,7 @@ def _build_fallback_break_quest(article: dict[str, str]) -> dict[str, object]:
     vocabulary = [
         {
             'word': word,
-            'meaningVi': 'Tu khoa lien quan den bai doc nay.',
+            'meaningVi': 'Từ khóa liên quan đến bài đọc này.',
             'exampleEn': f'The article mentions {word} in a short context.',
             'sourceSentence': summary,
         }
@@ -314,7 +347,7 @@ def _build_fallback_break_quest(article: dict[str, str]) -> dict[str, object]:
             'question': f'Which word appears in the article highlight for "{title}"?',
             'options': [selected_words[0], 'review', 'session'],
             'correctIndex': 0,
-            'explanationVi': 'Chon tu khoa duoc lay truc tiep tu bai doc.',
+            'explanationVi': 'Chọn từ khóa được lấy trực tiếp từ bài đọc.',
         }
     ]
     return BreakQuestResponse(
@@ -325,13 +358,12 @@ def _build_fallback_break_quest(article: dict[str, str]) -> dict[str, object]:
         vocabulary=vocabulary,
         questions=questions,
         companionLines=[
-            'Mình đã chuẩn bị một Break Quest ngắn để bạn đọc nhanh và học 3 từ mới.',
-            'Cố lên nhé! Mỗi ngày học thêm một chút xíu thôi là giỏi lắm rồi.',
-            'Nghỉ ngơi đọc tin tức một chút rồi chúng ta quay lại học tiếp nhé.',
-            'Đừng bỏ cuộc! Bạn đang làm rất tốt, hãy nạp năng lượng bằng Break Quest này.',
-            'Cùng nhau học từ vựng để tăng thêm hiểu biết nào!',
+            "Mình đã chuẩn bị một Break Quest ngắn để bạn đọc nhanh và học 3 từ mới.",
+            "Cố lên nhé! Mỗi ngày học thêm một chút xíu thôi là giỏi lắm rồi.",
+            "Nghỉ ngơi đọc tin tức một chút rồi chúng ta quay lại học tiếp nhé.",
+            "Đừng bỏ cuộc! Bạn đang làm rất tốt, hãy nạp năng lượng bằng Break Quest này.",
+            "Cùng nhau học từ vựng để tăng thêm hiểu biết nào!",
         ],
-        source='fallback',
     ).model_dump()
 
 
@@ -520,7 +552,6 @@ def generate_motivational_lines() -> list[str]:
             "Hôm nay bạn đã tiến bộ hơn ngày hôm qua rồi đó.",
             "Chúng ta cùng cố gắng nhé!"
         ]
-
     endpoint = urljoin(settings.mistral_api_base.rstrip('/') + '/', MISTRAL_CHAT_COMPLETIONS_PATH.lstrip('/'))
     request_payload = {
         'model': settings.mistral_model,
@@ -577,7 +608,7 @@ def generate_motivational_lines() -> list[str]:
         return [
             "Cố lên nhé! Mỗi ngày học thêm một chút xíu thôi là giỏi lắm rồi.",
             "Hãy cứ bước đi, dù chậm nhưng chắc chắn bạn sẽ tới đích.",
-            "Mọi cố gắng hôm nay sẽ được đền đáp vào ngày mai.",
+            "Mới cố gắng hôm nay sẽ được đền đáp vào ngày mai.",
             "Bạn đang làm rất tốt, đừng bỏ cuộc nhé!",
             "Tập trung thêm một chút nữa nào!",
             "Hãy giữ tinh thần thoải mái để học tập hiệu quả.",
@@ -593,7 +624,11 @@ def get_newsfeed(limit: int = 8) -> dict[str, object]:
     if _cache_valid() and _CACHE.get('items'):
         cached_items = _CACHE['items']
         if isinstance(cached_items, list):
-            return NewsfeedResponse(items=cached_items[:safe_limit]).model_dump()
+            sanitized_cached_items = [
+                _sanitize_newsfeed_item(item) if isinstance(item, NewsfeedItem) else item
+                for item in cached_items[:safe_limit]
+            ]
+            return NewsfeedResponse(items=sanitized_cached_items).model_dump()
 
     grouped_items: list[list[NewsfeedItem]] = []
     for source in FEED_SOURCES:
@@ -606,7 +641,7 @@ def get_newsfeed(limit: int = 8) -> dict[str, object]:
             continue
 
     merged_items = _merge_by_round_robin(grouped_items)
-    items = _dedupe_items(merged_items, CACHE_MAX_ITEMS)
+    items = [_sanitize_newsfeed_item(item) for item in _dedupe_items(merged_items, CACHE_MAX_ITEMS)]
     _CACHE['items'] = items
     _CACHE['expires_at'] = datetime.now(UTC) + CACHE_TTL
     return NewsfeedResponse(items=items[:safe_limit]).model_dump()
